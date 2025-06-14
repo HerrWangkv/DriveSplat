@@ -1,0 +1,3 @@
+[submodule "third_party/Lotus"]
+	path = third_party/Lotus
+	url = https://github.com/EnVision-Research/Lotus.git
