@@ -3,12 +3,9 @@ from torch.utils.data import Dataset
 import os
 import numpy as np
 from PIL import Image
-import hydra
 from nuscenes.nuscenes import NuScenes
 from nuscenes.utils.splits import create_splits_scenes
 from nuscenes.eval.common.utils import Quaternion
-from nuscenes.map_expansion.map_api import NuScenesMap
-import torch.nn.functional as F
 
 import warnings
 from typing import List
@@ -20,7 +17,8 @@ from tqdm import tqdm
 import sys
 # Add the project root directory to the Python path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
-from datasets.utils.box_depth_dataset import BoxDepthDataset
+from datasets.utils.box_depth_projection import BoxDepthProjector
+from utils.img_utils import concat_6_views, disparity2depth, concat_and_visualize_6_depths
 
 warnings.filterwarnings("ignore")
 
@@ -42,6 +40,7 @@ def timer(func):
 
 
 class NuScenesBase(NuScenes):
+
     def __init__(
         self,
         version,
@@ -49,10 +48,10 @@ class NuScenesBase(NuScenes):
         cache_dir,
         split,
         view_order,
-        object_classes,
-        map_classes,
-        lane_classes,
-        map_bound,
+        # object_classes,
+        # map_classes,
+        # lane_classes,
+        # map_bound,
         N,
         verbose=True,
         **kwargs,
@@ -69,12 +68,12 @@ class NuScenesBase(NuScenes):
         super().__init__(version=version, dataroot=dataroot, verbose=verbose, **kwargs)
         self.cache_dir = os.path.join(cache_dir, version)
         self.split = split
-        self.object_classes = object_classes
-        self.map_classes = map_classes
-        self.lane_classes = lane_classes
-        self.map_bound = map_bound
-        self.map_size = map_bound[1] - map_bound[0]
-        self.canvas_size = int(self.map_size / map_bound[2])
+        # self.object_classes = object_classes
+        # self.map_classes = map_classes
+        # self.lane_classes = lane_classes
+        # self.map_bound = map_bound
+        # self.map_size = map_bound[1] - map_bound[0]
+        # self.canvas_size = int(self.map_size / map_bound[2])
         if isinstance(self.split, str):
             self.seqs = []
             self.accumulate_seqs()
@@ -118,7 +117,7 @@ class NuScenesBase(NuScenes):
         self.instance_infos = [None for _ in self.seqs]
         self.frame_instances = [None for _ in self.seqs]
         self.accumulate_objects()
-        self.maps = {}
+        # self.maps = {}
         # self.accumulate_maps()
 
     def accumulate_seqs(self):
@@ -530,13 +529,21 @@ class NuScenesBase(NuScenes):
             instance_info = self.instance_infos[seq_idx][instance_id]
         else:
             instance_info = self.instance_infos[seq_idx][str(instance_id)]
-        id = instance_info["id"]
         class_name = instance_info["class_name"]
         if frame_idx in instance_info["frame_annotations"]:
             obj_to_world, box_size = instance_info["frame_annotations"][frame_idx]
         else:
             obj_to_world, box_size = instance_info["frame_annotations"][str(frame_idx)]
-        return id, class_name, np.array(obj_to_world), box_size
+        return class_name, np.array(obj_to_world), box_size
+
+    def get_frame_objects(self, index):
+        frame_instances = self.get_frame_instances(index)
+        objects = []
+
+        for instance_id in frame_instances:
+            _, obj_to_world, box_size = self.get_frame_annotation(index, instance_id)
+            objects.append({"obj_to_world": obj_to_world, "box_size": box_size})
+        return objects
 
     def get_ego_pose(self, index, sensor):
         if sensor == "LIDAR_TOP":
@@ -664,79 +671,56 @@ class NuScenesBase(NuScenes):
         camera_intrinsics[1] *= img_size[0] / 900
         return camera_intrinsics
 
-class NuScenesBoxDepth(BoxDepthDataset):
+    def get_camera_params(self, index, img_size=(900, 1600)):
+        camera_params = {}
+
+        for cam in self.cameras:
+            world_to_cam = self.get_world_to_cam(index, cam)
+            camera_intrinsics = self.get_camera_intrinsics(
+                index, cam, img_size=img_size
+            )
+
+            camera_params[cam] = {
+                "world_to_cam": world_to_cam,
+                "intrinsics": camera_intrinsics,
+            }
+        return camera_params
+
+
+class NuScenesBoxDisparity(Dataset):
     def __init__(self, nusc, img_size):
         """
-        Accurate depth map generation using PyTorch3D rendering capabilities.
-        
+        Accurate disparity map generation using PyTorch3D rendering capabilities.
+
         Args:
             nusc: NuScenesBase instance
-            img_size: Tuple of (width, height) for output depth maps
+            height (int): Height of the disparity map
+            width (int): Width of the disparity map
         """
-        super().__init__(img_size=img_size)
+        super().__init__()
         self.nusc = nusc
+        self.img_size = img_size
+        self.depth_projector = BoxDepthProjector(
+            img_size=img_size,
+        )
 
     def __len__(self):
         return len(self.nusc.lidar_data_tokens)
-    
-    def get_frame_objects(self, index):
-        """
-        Get all 3D objects for a given frame.
-        
-        Args:
-            index: Frame index
-            
-        Returns:
-            A list of objects where each object is a dict with keys:
-                - obj_to_world: 4x4 transformation matrix from object to world coordinates
-                - box_size: 3D dimensions of the box [length, width, height]
-        """
-        frame_instances = self.nusc.get_frame_instances(index)
-        objects = []
-        
-        for instance_id in frame_instances:
-            id, class_name, obj_to_world, box_size = self.nusc.get_frame_annotation(index, instance_id)
-            # if id != '3843d35144d84c02b387678f9bc7f2ed':
-            #     continue
-            objects.append({
-                'obj_to_world': obj_to_world,
-                'box_size': box_size
-            })
-            # break
-        return objects
-    
-    def get_camera_params(self, index):
-        """
-        Get camera parameters for all cameras in a given frame.
-        
-        Args:
-            index: Frame index
-            
-        Returns:
-            Dict mapping camera names to their parameters:
-                - world_to_cam: 4x4 transformation matrix from world to camera coordinates
-                - intrinsics: 3x3 camera intrinsic matrix
-        """
-        camera_params = {}
-        
-        for cam in self.nusc.cameras:
-            world_to_cam = self.nusc.get_world_to_cam(index, cam)
-            camera_intrinsics = self.nusc.get_camera_intrinsics(index, cam)
-            
-            camera_params[cam] = {
-                'world_to_cam': world_to_cam,
-                'intrinsics': camera_intrinsics
-            }
-        return camera_params
-    
+
     def __getitem__(self, index):
-        # Use the parent class implementation which uses our BoxDepthProjector
-        depth_maps = super().__getitem__(index)
-        final_outputs = []
+        objects = self.nusc.get_frame_objects(index)
+        camera_params = self.nusc.get_camera_params(index, img_size=self.img_size)
+        depth_maps = self.depth_projector.render_depth_from_boxes(
+            objects, camera_params
+        )
+        disparity_maps = []
         for cam in self.nusc.cameras:
-            final_outputs.append(depth_maps[cam])
-        
-        return torch.stack(final_outputs, dim=0)
+            depth_map = depth_maps[cam]
+            disparity_map = 1 / depth_map
+            disparity_maps.append(disparity_map)
+        disparity_maps = torch.stack(disparity_maps, axis=0)[:, None]
+        return {"disparity_maps": disparity_maps}
+
 
 class NuScenesCameraImages(Dataset):
     def __init__(self, nusc, img_size):
@@ -761,3 +745,49 @@ class NuScenesCameraImages(Dataset):
             pixel_values.append(img)
         pixel_values = torch.tensor(pixel_values)
         return {"pixel_values": pixel_values}
+
+
+class LotusNuScenesDataset(Dataset):
+    def __init__(
+        self,
+        version,
+        dataroot,
+        cache_dir,
+        split,
+        view_order,
+        N,
+        height,
+        width,
+        **kwargs,
+    ):
+        self.nusc = NuScenesBase(
+            version=version,
+            dataroot=dataroot,
+            cache_dir=cache_dir,
+            split=split,
+            view_order=view_order,
+            N=N,
+            **kwargs,
+        )
+        self.img_size = (height, width)
+        self.pixel_values = NuScenesCameraImages(self.nusc, self.img_size)
+        self.disparity_maps = NuScenesBoxDisparity(self.nusc, self.img_size)
+
+    def __len__(self):
+        return len(self.nusc.lidar_data_tokens)
+
+    def __getitem__(self, index):
+        ret = {
+            "pixel_values": self.pixel_values[index]["pixel_values"],
+            "disparity_maps": self.disparity_maps[index]["disparity_maps"],
+        }
+        return ret
+
+    def vis(self, index):
+        item = self[index]
+        disparity_maps = item["disparity_maps"]
+        pixel_values = item["pixel_values"]
+        concated_pixel_values = concat_6_views(pixel_values)
+        concated_pixel_values.save(f"concated_pixel_values.png")
+        depth_maps = disparity2depth(disparity_maps)
+        concat_and_visualize_6_depths(depth_maps, f"concated_depth_maps.png")

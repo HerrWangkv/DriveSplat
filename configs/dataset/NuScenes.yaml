@@ -1,0 +1,65 @@
+name: NuScenes
+dataset_type_nuscenes: LotusNuScenesDataset
+nuscenes_version: v1.0-mini
+dataroot: /storage_local/kwang/nuscenes/raw/
+cache: /storage_local/kwang/nuscenes/cache/
+scene_idx: 0
+height: 432
+width: 768
+image_size: [432, 768]
+interpolated_frame_between_keyframes: 5
+
+view_order_nuscenes:
+  - "CAM_FRONT_LEFT"
+  - "CAM_FRONT"
+  - "CAM_FRONT_RIGHT"
+  - "CAM_BACK_RIGHT"
+  - "CAM_BACK"
+  - "CAM_BACK_LEFT"
+
+data:
+  trainval:
+    nuscenes:
+      type: ${....dataset_type_nuscenes}
+      version: v1.0-trainval
+      dataroot: ${....dataroot}
+      cache_dir: ${....cache}
+      split: "trainval"
+      view_order: ${....view_order_nuscenes}
+      N: ${....interpolated_frame_between_keyframes}
+      height: ${....height}
+      width: ${....width}
+  train:
+    nuscenes:
+      type: ${....dataset_type_nuscenes}
+      version: v1.0-trainval
+      dataroot: ${....dataroot}
+      cache_dir: ${....cache}
+      split: "train"
+      view_order: ${....view_order_nuscenes}
+      N: ${....interpolated_frame_between_keyframes}
+      height: ${....height}
+      width: ${....width}
+  val:
+    nuscenes:
+      type: ${....dataset_type_nuscenes}
+      version: v1.0-trainval
+      dataroot: ${....dataroot}
+      cache_dir: ${....cache}
+      split: "val"
+      view_order: ${....view_order_nuscenes}
+      N: ${....interpolated_frame_between_keyframes}
+      height: ${....height}
+      width: ${....width}
+  inference:
+    nuscenes:
+      type: ${....dataset_type_nuscenes}
+      version: ${....nuscenes_version}
+      dataroot: ${....dataroot}
+      cache_dir: ${....cache}
+      split: ${....scene_idx}
+      view_order: ${....view_order_nuscenes}
+      N: ${....interpolated_frame_between_keyframes}
+      height: ${....height}
+      width: ${....width}
+      
