@@ -101,6 +101,8 @@ def disparity2depth(disparity, **kwargs):
 def concat_and_visualize_6_depths(depths: Tuple[torch.Tensor, ...], save_path="concat_6_depths.png"):
     if isinstance(depths, torch.Tensor):
         depths = [depth.squeeze().detach().cpu().numpy() for depth in depths]
+    elif isinstance(depths, np.ndarray):
+        depths = [depth.squeeze() for depth in depths]
 
     fig, axes = plt.subplots(2, 3, figsize=(12, 4))
     vmin = min([np.min(d) for d in depths])

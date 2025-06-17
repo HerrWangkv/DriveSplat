@@ -772,7 +772,7 @@ class NuScenesEgoMasks(Dataset):
         return {"ego_masks": torch.tensor(ego_masks)}
 
 
-class LotusNuScenesDataset(Dataset):
+class SDaIGNuScenesDataset(Dataset):
     def __init__(
         self,
         version,
@@ -811,12 +811,18 @@ class LotusNuScenesDataset(Dataset):
     def __getitem__(self, index):
         interval = 1 if not self.is_last_frame(index) else -1
         ret = {}
-        ret["pixel_values", 0] = self.pixel_values[index]["pixel_values"]
-        ret["pixel_values", 1] = self.pixel_values[index + interval]["pixel_values"]
-        ret["disparity_maps", 0] = self.disparity_maps[index]["disparity_maps"]
-        ret["disparity_maps", 1] = self.disparity_maps[index + interval][
-            "disparity_maps"
-        ]
+        ret["pixel_values", 0] = (
+            self.pixel_values[index]["pixel_values"] * 2 - 1
+        )  # Normalize to [-1, 1]
+        ret["pixel_values", 1] = (
+            self.pixel_values[index + interval]["pixel_values"] * 2 - 1
+        )  # Normalize to [-1, 1]
+        ret["disparity_maps", 0] = (
+            self.disparity_maps[index]["disparity_maps"] * 2 - 1
+        )  # Normalize to [-1, 1]
+        ret["disparity_maps", 1] = (
+            self.disparity_maps[index + interval]["disparity_maps"] * 2 - 1
+        )  # Normalize to [-1, 1]
         ret["ego_masks"] = self.ego_masks[index]["ego_masks"]
         intrinsics = []
         extrinsics0 = []
@@ -834,12 +840,12 @@ class LotusNuScenesDataset(Dataset):
         ret["intrinsics"] = torch.stack(intrinsics, dim=0)
         ret["extrinsics", 0] = torch.stack(extrinsics0, dim=0)
         ret["extrinsics", 1] = torch.stack(extrinsics1, dim=0)
-        return ret
+        return {k: v.cpu().to(torch.float32) for k, v in ret.items()}
 
     def vis(self, index):
         item = self[index]
-        disparity_maps = item["disparity_maps", 0]
-        pixel_values = item["pixel_values", 0]
+        disparity_maps = (item["disparity_maps", 0] + 1) / 2  # Normalize to [0, 1]
+        pixel_values = (item["pixel_values", 0] + 1) / 2  # Normalize to [0, 1]
         ego_masks = item["ego_masks"]
         pixel_values *= ego_masks
         concated_pixel_values = concat_6_views(pixel_values)

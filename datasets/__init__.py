@@ -1,5 +1,5 @@
 # datasets/__init__.py
-from datasets.NuScenes.NuScenes import LotusNuScenesDataset
+from datasets.NuScenes.NuScenes import SDaIGNuScenesDataset
 
 
 def build_dataset_from_cfg(cfg):
@@ -13,7 +13,7 @@ def build_dataset_from_cfg(cfg):
     """
     args = dict(cfg)
     dataset_type = args.pop("type")
-    if dataset_type == "LotusNuScenesDataset":
-        return LotusNuScenesDataset(**args)
+    if dataset_type == "SDaIGNuScenesDataset":
+        return SDaIGNuScenesDataset(**args)
     else:
         raise KeyError(f"{dataset_type} is not a valid dataset type")

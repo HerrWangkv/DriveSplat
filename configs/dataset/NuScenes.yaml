@@ -1,12 +1,11 @@
 name: NuScenes
-dataset_type_nuscenes: LotusNuScenesDataset
+dataset_type_nuscenes: SDaIGNuScenesDataset
 nuscenes_version: v1.0-mini
 dataroot: /storage_local/kwang/nuscenes/raw/
 cache: /storage_local/kwang/nuscenes/cache/
 scene_idx: 0
 height: 432
 width: 768
-image_size: [432, 768]
 interpolated_frame_between_keyframes: 5
 
 view_order_nuscenes:
