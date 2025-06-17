@@ -102,27 +102,62 @@ class BoxDepthProjector:
 
     def create_bbox_mesh(self, box_size):
         """
-        Create a 3D mesh for a bounding box.
-        
+        Create 3D meshes for bounding boxes in a batch-efficient manner.
+
         Args:
-            box_size: 3D dimensions of the box [length, width, height]
-            
+            box_size: 3D dimensions of the box(es)
+                     - Single box: [length, width, height] or [3]
+                     - Batch: [N, 3] where N is the number of boxes
+
         Returns:
-            vertices: Tensor of vertices [8, 3]
-            faces: Tensor of face indices [12, 3]
+            If single box:
+                vertices: Tensor of vertices [8, 3]
+                faces: Tensor of face indices [12, 3]
+            If batch:
+                vertices: Tensor of vertices [N, 8, 3]
+                faces: Tensor of face indices [N, 12, 3]
         """
         # Convert box_size to tensor if it's not already
         if not isinstance(box_size, torch.Tensor):
             box_size = torch.tensor(box_size, dtype=torch.float32, device=self.device)
         else:
-            # Ensure float32 data type
-            box_size = box_size.to(dtype=torch.float32)
+            # Ensure float32 data type and move to correct device
+            box_size = box_size.to(dtype=torch.float32, device=self.device)
 
         # Get unit box vertices and faces (cached)
-        unit_vertices, faces = self._create_unit_bbox_mesh()
+        unit_vertices, unit_faces = self._create_unit_bbox_mesh()
 
-        # Scale the vertices by box_size
-        vertices = unit_vertices * box_size.reshape(1, 3)
+        # Handle both single box and batch cases
+        if box_size.dim() == 1:
+            # Single box case: [3] -> [1, 3] for broadcasting
+            if box_size.shape[0] != 3:
+                raise ValueError(
+                    f"Single box_size must have 3 elements, got {box_size.shape[0]}"
+                )
+
+            # Scale the vertices by box_size
+            vertices = unit_vertices * box_size.reshape(1, 3)
+            faces = unit_faces
+
+        elif box_size.dim() == 2:
+            # Batch case: [N, 3]
+            batch_size = box_size.shape[0]
+            if box_size.shape[1] != 3:
+                raise ValueError(
+                    f"Batch box_size must have shape [N, 3], got {box_size.shape}"
+                )
+
+            # Expand unit vertices for batch processing: [8, 3] -> [N, 8, 3]
+            batch_unit_vertices = unit_vertices.unsqueeze(0).expand(batch_size, -1, -1)
+
+            # Scale vertices for each box: [N, 8, 3] * [N, 1, 3] -> [N, 8, 3]
+            vertices = batch_unit_vertices * box_size.unsqueeze(1)
+
+            # Expand faces for batch: [12, 3] -> [N, 12, 3]
+            faces = unit_faces.unsqueeze(0).expand(batch_size, -1, -1)
+
+        else:
+            raise ValueError(f"box_size must be 1D or 2D tensor, got {box_size.dim()}D")
 
         return vertices, faces
 
@@ -226,99 +261,28 @@ class BoxDepthProjector:
         rasterizer = MeshRasterizer(
             cameras=cameras, raster_settings=self.raster_settings
         )
-
-        # Group objects by box size for efficient processing
-        box_size_to_objects = {}
-        for obj_idx, obj in enumerate(object_list):
-            box_size = obj["box_size"]
-            if isinstance(box_size, np.ndarray):
-                box_size_key = tuple(box_size.flatten())
-            elif isinstance(box_size, torch.Tensor):
-                box_size_key = tuple(box_size.cpu().numpy().flatten())
-            else:
-                box_size_key = tuple(box_size)
-
-            if box_size_key not in box_size_to_objects:
-                box_size_to_objects[box_size_key] = []
-            box_size_to_objects[box_size_key].append(obj_idx)
-
-        # Process each group of objects with same box size
-        for box_size_key, obj_indices in box_size_to_objects.items():
-            if len(obj_indices) == 0:
-                continue
-
-            num_objects = len(obj_indices)
-            vertices, faces = self.create_bbox_mesh(box_size_key)
-
-            # Batch all object transformations
-            obj_to_world_batch = torch.zeros(
-                num_objects, 4, 4, dtype=torch.float32, device=self.device
+        for obj in object_list:
+            vertices, faces = self.create_bbox_mesh(obj["box_size"])
+            obj_to_world = torch.tensor(
+                obj["obj_to_world"], dtype=torch.float32, device=self.device
             )
+            verts_world = vertices @ obj_to_world[:3, :3].T + obj_to_world[:3, 3]
+            replicated_verts = [verts_world for _ in range(num_cameras)]
+            replicated_faces = [faces for _ in range(num_cameras)]
+            mesh = Meshes(verts=replicated_verts, faces=replicated_faces)
+            fragments = rasterizer(mesh)
+            zbuf = fragments.zbuf[..., 0]
+            valid_masks = zbuf > 0
+            # Update outputs for each camera
+            for cam_idx, cam_name in enumerate(cam_names):
+                # Get the depth map for this camera
+                depth_map = zbuf[cam_idx]
+                valid_mask = valid_masks[cam_idx]
 
-            for i, obj_idx in enumerate(obj_indices):
-                obj = object_list[obj_idx]
-                obj_to_world = obj["obj_to_world"]
-
-                if isinstance(obj_to_world, np.ndarray):
-                    obj_to_world_batch[i] = torch.tensor(
-                        obj_to_world, dtype=torch.float32, device=self.device
-                    )
-                else:
-                    obj_to_world_batch[i] = obj_to_world.to(
-                        dtype=torch.float32, device=self.device
-                    )
-
-            # Transform vertices to world space (batched)
-            vertices_batch = vertices.unsqueeze(0).expand(num_objects, -1, -1)
-            ones_batch = torch.ones(
-                num_objects, vertices.shape[0], 1, device=self.device
-            )
-            verts_obj_homo_batch = torch.cat([vertices_batch, ones_batch], dim=2)
-
-            verts_world_batch = torch.bmm(
-                verts_obj_homo_batch, obj_to_world_batch.transpose(-2, -1)
-            )[:, :, :3]
-
-            # Create mesh lists for PyTorch3D batched rendering
-            verts_world_list = [verts_world_batch[i] for i in range(num_objects)]
-            faces_list = [faces for _ in range(num_objects)]
-
-            # Render all objects across all cameras at once
-            if verts_world_list:
-                # Create replicated vertex and face lists
-                replicated_verts = []
-                replicated_faces = []
-
-                for cam_idx in range(num_cameras):
-                    for obj_idx in range(num_objects):
-                        replicated_verts.append(verts_world_list[obj_idx])
-                        replicated_faces.append(faces_list[obj_idx])
-
-                mesh = Meshes(verts=replicated_verts, faces=replicated_faces)
-                fragments = rasterizer(mesh)
-
-                zbuf = fragments.zbuf[..., 0]
-
-                # Reshape to [num_cameras, num_objects, H, W]
-                zbuf = zbuf.view(
-                    num_cameras, num_objects, self.img_height, self.img_width
+                # Update the output depth map only where valid
+                outputs[cam_name][valid_mask] = torch.minimum(
+                    outputs[cam_name][valid_mask], depth_map[valid_mask]
                 )
-
-                # Vectorized processing: combine depths by taking minimum across objects for all cameras
-                # Take minimum depth across all objects: [num_cameras, H, W]
-                min_depths = torch.min(zbuf, dim=1)[0]
-
-                # Create valid masks for all cameras: [num_cameras, H, W]
-                valid_masks = min_depths > 0
-
-                # Update outputs for all cameras at once
-                for cam_idx, cam_name in enumerate(cam_names):
-                    valid_mask = valid_masks[cam_idx]
-                    min_depth = min_depths[cam_idx]
-                    outputs[cam_name][valid_mask] = torch.minimum(
-                        outputs[cam_name][valid_mask], min_depth[valid_mask]
-                    )
-
         # Replace inf with zeros
         final_outputs = {cam_name: depth_map for cam_name, depth_map in outputs.items()}
 

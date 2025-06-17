@@ -747,6 +747,31 @@ class NuScenesCameraImages(Dataset):
         return {"pixel_values": pixel_values}
 
 
+class NuScenesEgoMasks(Dataset):
+    def __init__(self, nusc, img_size):
+        super().__init__()
+        self.nusc = nusc
+        self.img_size = img_size
+
+    def __len__(self):
+        return len(self.nusc.seq_indices)
+
+    def __getitem__(self, index):
+        seq_idx, _ = self.nusc.seq_indices[index]
+        scene_idx = self.nusc.seqs[seq_idx]
+        ego_masks = np.ones(
+            (len(self.nusc.cameras), 1, self.img_size[0], self.img_size[1])
+        ).astype(bool)
+        for cam_idx, cam in enumerate(self.nusc.cameras):
+            if cam == "CAM_BACK":
+                trunk_mask = Image.open(
+                    os.path.join(self.nusc.cache_dir, "masks", f"{scene_idx}.png")
+                ).convert("L")
+                trunk_mask = trunk_mask.resize((self.img_size[1], self.img_size[0]))
+                ego_masks[cam_idx, 0] = 1 - np.array(trunk_mask).astype(bool)
+        return {"ego_masks": torch.tensor(ego_masks)}
+
+
 class LotusNuScenesDataset(Dataset):
     def __init__(
         self,
@@ -772,21 +797,51 @@ class LotusNuScenesDataset(Dataset):
         self.img_size = (height, width)
         self.pixel_values = NuScenesCameraImages(self.nusc, self.img_size)
         self.disparity_maps = NuScenesBoxDisparity(self.nusc, self.img_size)
+        self.ego_masks = NuScenesEgoMasks(self.nusc, img_size=self.img_size)
 
     def __len__(self):
         return len(self.nusc.lidar_data_tokens)
 
+    def is_first_frame(self, index):
+        return self.nusc.is_first_frame(index)
+
+    def is_last_frame(self, index):
+        return self.nusc.is_last_frame(index)
+
     def __getitem__(self, index):
-        ret = {
-            "pixel_values": self.pixel_values[index]["pixel_values"],
-            "disparity_maps": self.disparity_maps[index]["disparity_maps"],
-        }
+        interval = 1 if not self.is_last_frame(index) else -1
+        ret = {}
+        ret["pixel_values", 0] = self.pixel_values[index]["pixel_values"]
+        ret["pixel_values", 1] = self.pixel_values[index + interval]["pixel_values"]
+        ret["disparity_maps", 0] = self.disparity_maps[index]["disparity_maps"]
+        ret["disparity_maps", 1] = self.disparity_maps[index + interval][
+            "disparity_maps"
+        ]
+        ret["ego_masks"] = self.ego_masks[index]["ego_masks"]
+        intrinsics = []
+        extrinsics0 = []
+        extrinsics1 = []
+        for cam in self.nusc.cameras:
+            intrinsics.append(
+                torch.tensor(
+                    self.nusc.get_camera_intrinsics(index, cam, img_size=self.img_size)
+                )
+            )
+            extrinsics0.append(torch.tensor(self.nusc.get_world_to_cam(index, cam)))
+            extrinsics1.append(
+                torch.tensor(self.nusc.get_world_to_cam(index + interval, cam))
+            )
+        ret["intrinsics"] = torch.stack(intrinsics, dim=0)
+        ret["extrinsics", 0] = torch.stack(extrinsics0, dim=0)
+        ret["extrinsics", 1] = torch.stack(extrinsics1, dim=0)
         return ret
 
     def vis(self, index):
         item = self[index]
-        disparity_maps = item["disparity_maps"]
-        pixel_values = item["pixel_values"]
+        disparity_maps = item["disparity_maps", 0]
+        pixel_values = item["pixel_values", 0]
+        ego_masks = item["ego_masks"]
+        pixel_values *= ego_masks
         concated_pixel_values = concat_6_views(pixel_values)
         concated_pixel_values.save(f"concated_pixel_values.png")
         depth_maps = disparity2depth(disparity_maps)
