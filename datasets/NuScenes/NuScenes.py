@@ -759,7 +759,7 @@ class NuScenesEgoMasks(Dataset):
     def __getitem__(self, index):
         seq_idx, _ = self.nusc.seq_indices[index]
         scene_idx = self.nusc.seqs[seq_idx]
-        ego_masks = np.ones(
+        ego_masks = np.zeros(
             (len(self.nusc.cameras), 1, self.img_size[0], self.img_size[1])
         ).astype(bool)
         for cam_idx, cam in enumerate(self.nusc.cameras):
@@ -768,7 +768,7 @@ class NuScenesEgoMasks(Dataset):
                     os.path.join(self.nusc.cache_dir, "masks", f"{scene_idx}.png")
                 ).convert("L")
                 trunk_mask = trunk_mask.resize((self.img_size[1], self.img_size[0]))
-                ego_masks[cam_idx, 0] = 1 - np.array(trunk_mask).astype(bool)
+                ego_masks[cam_idx, 0] = np.array(trunk_mask).astype(bool)
         return {"ego_masks": torch.tensor(ego_masks)}
 
 

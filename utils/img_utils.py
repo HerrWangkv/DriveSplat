@@ -75,6 +75,20 @@ def concat_6_views(imgs: Tuple[Image.Image, ...], oneline=False):
                 ).convert("L")
                 for img in imgs
             ]
+    elif isinstance(imgs, np.ndarray):
+        if imgs.shape[1] == 3:
+            imgs = [
+                Image.fromarray(
+                    (img.transpose(1, 2, 0) * 255).astype(np.uint8)
+                ).convert("RGB")
+                for img in imgs
+            ]
+        else:
+            assert imgs.shape[1] == 1
+            imgs = [
+                Image.fromarray((img.squeeze() * 255).astype(np.uint8)).convert("L")
+                for img in imgs
+            ]
     if oneline:
         image = img_concat_h(*imgs)
     else:

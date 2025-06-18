@@ -1,11 +1,10 @@
 import logging
 import os
 import argparse
-from pathlib import Path
-from PIL import Image
 from contextlib import nullcontext
 
 import torch
+import numpy as np
 from tqdm.auto import tqdm
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
@@ -15,6 +14,7 @@ from diffusers.utils import check_min_version
 from pipeline import SDaIGControlNetPipeline
 from datasets import build_dataset_from_cfg
 from utils.img_utils import concat_6_views, disparity2depth, concat_and_visualize_6_depths
+from utils.nvs_utils import render_novel_view
 from third_party.Lotus.utils.seed_all import seed_all
 
 check_min_version('0.28.0.dev0')
@@ -177,28 +177,29 @@ def main():
             else:
                 autocast_ctx = torch.autocast(pipeline.device.type)
             with autocast_ctx:
-                task_emb = torch.tensor([1, 0]).float().unsqueeze(0).repeat(1, 1).to(device)
-                task_emb = torch.cat([torch.sin(task_emb), torch.cos(task_emb)], dim=-1).repeat(1, 1)
-
                 # Run
                 preds = pipeline(
-                    rgb_in=data["pixel_values", 0][0], 
+                    rgb_in=data["pixel_values", 0][0],
                     disparity_in=data["disparity_maps", 0][0],
-                    prompt=['' for _ in range(data["pixel_values", 0].shape[1])], 
-                    num_inference_steps=1, 
-                    generator=generator, 
+                    prompt=["" for _ in range(data["pixel_values", 0].shape[1])],
+                    num_inference_steps=1,
+                    generator=generator,
                     # guidance_scale=0,
-                    output_type='np',
+                    output_type="np",
                     timesteps=[args.timestep],
-                    task_emb=task_emb,
                     processing_res=processing_res,
                     match_input_res=match_input_res,
                     resample_method=resample_method,
-                    ).images
+                ).images
 
-                preds = preds.mean(axis=-1)  # [B, 1, H, W]
-                preds[preds < 0.005] = 0.005  # Thresholding to remove noise
-                depth = disparity2depth(preds)
+                disparity_out, rgb_out = np.split(preds, 2, axis=0)  # [6, H, W, 3]
+                disparity_out = disparity_out.mean(axis=-1)  # [B, H, W]
+                rgb_out = rgb_out.transpose(0, 3, 1, 2)  # [B, 3, H, W]
+
+                disparity_out[disparity_out < 0.005] = (
+                    0.005  # Thresholding to remove noise
+                )
+                depth = disparity2depth(disparity_out)
                 concat_and_visualize_6_depths(
                     depth, 
                     save_path=os.path.join(output_dir, f"{frame:04d}_depth.png")
@@ -206,7 +207,27 @@ def main():
                 concat_6_views(
                     (data["pixel_values", 0][0] + 1) / 2,  # Normalize to [0, 1]
                 ).save(os.path.join(output_dir, f"{frame:04d}_camera.png"))
-
+                concat_6_views(
+                    rgb_out,
+                ).save(os.path.join(output_dir, f"{frame:04d}_rgb.png"))
+            novel_images, novel_depth = render_novel_view(
+                rgb_out,
+                depth,
+                data["ego_masks"][0].squeeze(),
+                data["intrinsics"][0],
+                data["extrinsics", 0][0],
+                data["intrinsics"][0],
+                data["extrinsics", 1][0],
+                (dataset_cfg.height, dataset_cfg.width),
+            )
+            concat_6_views(
+                novel_images.squeeze().permute([0, 3, 1, 2]),  # Normalize to [0, 1]
+            ).save(os.path.join(output_dir, f"{frame:04d}_novel_view.png"))
+            concat_and_visualize_6_depths(
+                novel_depth,
+                save_path=os.path.join(output_dir, f"{frame:04d}_novel_view_depth.png"),
+            )
+            breakpoint()
             torch.cuda.empty_cache()
 
     print('==> Inference is done. \n==> Results saved to:', args.output_dir)

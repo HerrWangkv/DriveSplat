@@ -1411,7 +1411,6 @@ class SDaIGControlNetPipeline(DirectDiffusionControlNetPipeline):
         self,
         rgb_in: Optional[torch.FloatTensor] = None,
         disparity_in: Optional[torch.FloatTensor] = None,
-        task_emb: Optional[torch.FloatTensor] = None,
         prompt: Union[str, List[str]] = None,
         num_inference_steps: int = 50,
         timesteps: List[int] = None,
@@ -1438,8 +1437,6 @@ class SDaIGControlNetPipeline(DirectDiffusionControlNetPipeline):
                 Input RGB tensor, range [-1, 1].
             disparity_in (`torch.FloatTensor`):
                 Input disparity tensor, range [-1, 1].
-            task_emb (`torch.FloatTensor`)
-                The task switcher to transfer the model outout domain between prediction and reconstruction.
             prompt (`str` or `List[str]`, *optional*):
                 The prompt or prompts to guide image generation. If not defined, you need to pass `prompt_embeds`.
             num_inference_steps (`int`, *optional*, defaults to 50):
@@ -1642,25 +1639,59 @@ class SDaIGControlNetPipeline(DirectDiffusionControlNetPipeline):
                     if isinstance(controlnet_cond_scale, list):
                         controlnet_cond_scale = controlnet_cond_scale[0]
                     cond_scale = controlnet_cond_scale * controlnet_keep[i]
+
+                # Generating depth and reconstruction simultaneously
+                depth_task_emb = (
+                    torch.tensor([1, 0])
+                    .float()
+                    .unsqueeze(0)
+                    .repeat(len(latent_model_input), 1)
+                    .to(device)
+                )
+                depth_task_emb = torch.cat(
+                    [torch.sin(depth_task_emb), torch.cos(depth_task_emb)], dim=-1
+                )
+                recontruction_task_emb = (
+                    torch.tensor([0, 1])
+                    .float()
+                    .unsqueeze(0)
+                    .repeat(len(latent_model_input), 1)
+                    .to(device)
+                )
+                recontruction_task_emb = torch.cat(
+                    [
+                        torch.sin(recontruction_task_emb),
+                        torch.cos(recontruction_task_emb),
+                    ],
+                    dim=-1,
+                )
                 down_block_res_samples, mid_block_res_sample = self.controlnet(
-                    control_model_input,
+                    torch.cat([control_model_input, control_model_input], dim=0),
                     t,
-                    encoder_hidden_states=controlnet_prompt_embeds,
-                    controlnet_cond=disparity_in,
+                    encoder_hidden_states=torch.cat(
+                        [controlnet_prompt_embeds, controlnet_prompt_embeds], dim=0
+                    ),
+                    controlnet_cond=torch.cat([disparity_in, disparity_in], dim=0),
                     conditioning_scale=cond_scale,
-                    class_labels=task_emb,
+                    class_labels=torch.cat(
+                        [depth_task_emb, recontruction_task_emb], dim=0
+                    ),
                     return_dict=False,
                 )
 
                 x0_pred = self.unet(
-                    latent_model_input,
+                    torch.cat([latent_model_input, latent_model_input], dim=0),
                     t,
-                    encoder_hidden_states=prompt_embeds,
+                    encoder_hidden_states=torch.cat(
+                        [prompt_embeds, prompt_embeds], dim=0
+                    ),
                     cross_attention_kwargs=self.cross_attention_kwargs,
                     down_block_additional_residuals=down_block_res_samples,
                     mid_block_additional_residual=mid_block_res_sample,
                     return_dict=False,
-                    class_labels=task_emb,
+                    class_labels=torch.cat(
+                        [depth_task_emb, recontruction_task_emb], dim=0
+                    ),
                 )[0]
 
                 if len(timesteps) > 1:
