@@ -6,7 +6,7 @@ cache: /storage_local/kwang/nuscenes/cache/
 scene_idx: 0
 height: 432
 width: 768
-interpolated_frame_between_keyframes: 5
+interpolated_frame_between_keyframes: 4
 
 cameras:
   - "CAM_FRONT_LEFT"

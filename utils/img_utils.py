@@ -109,8 +109,33 @@ def depth2disparity(depth, return_mask=False):
         return disparity
 
 
-def disparity2depth(disparity, **kwargs):
-    return depth2disparity(disparity, **kwargs)
+def disparity2depth(disparity, return_mask=False):
+    if isinstance(disparity, torch.Tensor):
+        depth = torch.ones_like(disparity) * float("inf")
+    elif isinstance(disparity, np.ndarray):
+        depth = np.ones_like(disparity) * float("inf")
+    non_negtive_mask = disparity > 0
+    depth[non_negtive_mask] = 1.0 / disparity[non_negtive_mask]
+    if return_mask:
+        return depth, non_negtive_mask
+    else:
+        return depth
+
+
+def set_inf_to_max(depth_maps):
+    # Set inf values in depth_maps to the maximal finite value
+    if torch.is_tensor(depth_maps):
+        finite_mask = torch.isfinite(depth_maps)
+        if finite_mask.any():
+            max_val = torch.max(depth_maps[finite_mask])
+            depth_maps = torch.where(torch.isinf(depth_maps), max_val, depth_maps)
+    else:
+        finite_mask = np.isfinite(depth_maps)
+        if finite_mask.any():
+            max_val = np.max(depth_maps[finite_mask])
+            depth_maps = np.where(np.isinf(depth_maps), max_val, depth_maps)
+    return depth_maps
+
 
 def concat_and_visualize_6_depths(depths: Tuple[torch.Tensor, ...], save_path="concat_6_depths.png"):
     if isinstance(depths, torch.Tensor):

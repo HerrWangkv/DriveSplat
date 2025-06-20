@@ -1,14 +1,15 @@
 import hydra
 
+
 @hydra.main(
     version_base=None,
-    config_path="configs/dataset",
-    config_name="NuScenes",
+    config_path="datasets/NuScenes",
+    config_name="sdaig",
 )
 def main(cfg):
     from datasets import build_dataset_from_cfg
 
-    dataset = build_dataset_from_cfg(cfg.data.inference.nuscenes)
+    dataset = build_dataset_from_cfg(cfg.data.trainval)
     dataset.vis(0)
     breakpoint()
 

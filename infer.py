@@ -132,7 +132,7 @@ def main():
 
     # -------------------- Data --------------------
     dataset_cfg = OmegaConf.load(args.dataset_config)
-    dataset = build_dataset_from_cfg(dataset_cfg.data.inference)
+    dataset = build_dataset_from_cfg(dataset_cfg.data.trainval)
     dataloader = DataLoader(
         dataset,
         batch_size=1,
@@ -220,8 +220,9 @@ def main():
                 data["extrinsics", 1][0],
                 (dataset_cfg.height, dataset_cfg.width),
             )
+            novel_depth[novel_depth > 200] = 200  # Thresholding to remove noise
             concat_6_views(
-                novel_images.squeeze().permute([0, 3, 1, 2]),  # Normalize to [0, 1]
+                novel_images.squeeze().permute([0, 3, 1, 2]),
             ).save(os.path.join(output_dir, f"{frame:04d}_novel_view.png"))
             concat_and_visualize_6_depths(
                 novel_depth,

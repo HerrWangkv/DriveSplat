@@ -153,10 +153,9 @@ def paste_ego_area(current_images: torch.Tensor,
     novel_depths = torch.where(current_ego_mask.bool(), 
                               current_depths, 
                               novel_depths)
-    
+
     return novel_images, novel_depths
 
-    
 
 def render_novel_view(current_images: Union[torch.Tensor, np.ndarray],
                      current_depths: Union[torch.Tensor, np.ndarray],
@@ -171,7 +170,7 @@ def render_novel_view(current_images: Union[torch.Tensor, np.ndarray],
                      background_color: Tuple[float, float, float] = (0.0, 0.0, 0.0)) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Render novel view using PyTorch3D point cloud rendering.
-    
+
     Args:
         current_images: Current view RGB images, shape (B, C, H, W), (C, H, W), (B, H, W, C), or (H, W, C)
                        Can be numpy array or torch tensor
@@ -186,24 +185,23 @@ def render_novel_view(current_images: Union[torch.Tensor, np.ndarray],
         point_radius: Radius of rendered points
         points_per_pixel: Number of points to consider per pixel
         background_color: Background color (R, G, B) in range [0, 1]
-    
+
     Returns:
         novel_images: Novel view RGB images, shape (B, H, W, 3)
         novel_depths: Novel view depth maps, shape (B, H, W)
     """
-    
     # Convert numpy arrays to torch tensors if needed
     if isinstance(current_images, np.ndarray):
         current_images = torch.from_numpy(current_images).float()
     if isinstance(current_depths, np.ndarray):  
         current_depths = torch.from_numpy(current_depths).float()
-    
+
     # Move to same device as intrinsics
     device = current_intrinsics.device
     current_images = current_images.to(device)
     current_depths = current_depths.to(device)
     current_ego_mask = current_ego_mask.to(device)
-    
+
     # Ensure batch dimension and convert to (B, H, W, C) format for depth_to_pointcloud
     if current_images.dim() == 3:
         # Single image case (C, H, W) -> (1, H, W, C)
@@ -217,7 +215,7 @@ def render_novel_view(current_images: Union[torch.Tensor, np.ndarray],
         squeeze_output = False
     else:
         raise ValueError("current_images must be of shape (B, C, H, W) or (C, H, W)")
-    
+
     if current_depths.dim() == 2:
         current_depths = current_depths.unsqueeze(0)
     if current_ego_mask.dim() == 2:
@@ -230,11 +228,11 @@ def render_novel_view(current_images: Union[torch.Tensor, np.ndarray],
         novel_intrinsics = novel_intrinsics.unsqueeze(0)
     if novel_extrinsics.dim() == 2:
         novel_extrinsics = novel_extrinsics.unsqueeze(0)
-    
+
     # Convert depth maps to point clouds (concatenated from all cameras)
     points, colors = depth_to_pointcloud(current_depths, current_intrinsics, 
                                        current_extrinsics, current_images, current_ego_mask)
-    
+
     # Create single PyTorch3D point cloud from all cameras
     # Filter out zero points
     if points.dim() == 2:
@@ -242,37 +240,37 @@ def render_novel_view(current_images: Union[torch.Tensor, np.ndarray],
     else:
         # This shouldn't happen with concatenation, but handle just in case
         raise ValueError("Unexpected point cloud dimensions after concatenation")
-    
+
     # Set up novel view cameras using batch processing
     R_batch = torch.zeros(batch_size, 3, 3, dtype=torch.float32, device=device)
     T_batch = torch.zeros(batch_size, 3, dtype=torch.float32, device=device)
     K_batch = torch.zeros(batch_size, 4, 4, dtype=torch.float32, device=device)
-    
+
     # Create R_flip tensor for PyTorch3D camera convention
     R_flip = torch.tensor([
         [-1.0, 0.0, 0.0],
         [0.0, -1.0, 0.0],
         [0.0, 0.0, 1.0],
     ], dtype=torch.float32, device=device)
-    
+
     for b in range(batch_size):
         # Convert extrinsics to PyTorch3D camera format
         # The extrinsics matrix is already world-to-camera transformation
         world_to_cam = novel_extrinsics[b].clone()
-        
+
         # Apply PyTorch3D camera convention
         world_to_cam[:3, :3] = torch.matmul(R_flip, world_to_cam[:3, :3])
         world_to_cam[:3, 3] = torch.matmul(R_flip, world_to_cam[:3, 3])
-        
+
         R = world_to_cam[:3, :3].T  # PyTorch3D expects transposed rotation
         T = world_to_cam[:3, 3]
-        
+
         # Prepare camera matrices for batch
         R_batch[b] = R.contiguous()
         T_batch[b] = T.contiguous()
         K_batch[b, :3, :3] = novel_intrinsics[b]
         K_batch[b, 3, 2] = 1.0
-    
+
     # Create batched camera
     cameras = PerspectiveCameras(
         K=K_batch,
@@ -282,19 +280,19 @@ def render_novel_view(current_images: Union[torch.Tensor, np.ndarray],
         image_size=((image_size[0], image_size[1]),),
         device=device,
     )
-    
+
     # Set up rasterization settings
     raster_settings = PointsRasterizationSettings(
         image_size=image_size,
         radius=point_radius,
         points_per_pixel=points_per_pixel,
     )
-    
+
     # Create renderer with batched cameras
     rasterizer = PointsRasterizer(cameras=cameras, raster_settings=raster_settings)
     compositor = AlphaCompositor(background_color=background_color)
     renderer = PointsRenderer(rasterizer=rasterizer, compositor=compositor)
-    
+
     # Create replicated point clouds for batch rendering
     replicated_points = [points[valid_points_mask] for _ in range(batch_size)]
     if colors is not None:
@@ -302,33 +300,33 @@ def render_novel_view(current_images: Union[torch.Tensor, np.ndarray],
         point_cloud_batch = Pointclouds(points=replicated_points, features=replicated_features)
     else:
         point_cloud_batch = Pointclouds(points=replicated_points)
-    
+
     # Render all novel views at once
     rendered = renderer(point_cloud_batch)
-    
+
     # Extract RGB and depth
     novel_images = rendered[..., :3]  # (B, H, W, 3)
-    
+
     # Extract depth from rasterizer's z-buffer
     # The rasterizer provides depth information through its fragments
     # Re-rasterize to get fragments with depth information
     fragments = rasterizer(point_cloud_batch)
     # Extract depth from z-buffer - fragments.zbuf shape: (B, H, W, K) where K is points_per_pixel
     zbuf = fragments.zbuf[..., 0]  # Take closest point depth: (B, H, W)
-    
+
     # Create depth mask - valid where zbuf > 0 (valid depth)
     valid_depth_mask = zbuf > 0
-    
+
     # Initialize depth maps
     novel_depths = torch.zeros(batch_size, *image_size, device=device)
-    
+
     # Set depth values where valid
     novel_depths[valid_depth_mask] = zbuf[valid_depth_mask]
-    
+
     if squeeze_output:
         novel_images = novel_images.squeeze(0)
         novel_depths = novel_depths.squeeze(0)
-        
+
     return paste_ego_area(current_images, current_depths, current_ego_mask, novel_images, novel_depths)
 
 
