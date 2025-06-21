@@ -1,11 +1,13 @@
 
 export CUDA=0
 
-export CHECKPOINT_DIR="jingheya/lotus-depth-g-v2-1-disparity"
+export CHECKPOINT_DIR="output/train-sdaig-bsz8/checkpoint-3500"
 export OUTPUT_DIR="output/Depth_G_Infer"
+export DATASET_CONFIG="data/NuScenes/sdaig.yaml"
 
 CUDA_VISIBLE_DEVICES=$CUDA python infer.py \
         --pretrained_model_name_or_path=$CHECKPOINT_DIR \
+        --dataset_config=$DATASET_CONFIG \
         --prediction_type="sample" \
         --seed=42 \
         --half_precision \

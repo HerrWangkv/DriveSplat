@@ -1409,8 +1409,8 @@ class SDaIGControlNetPipeline(DirectDiffusionControlNetPipeline):
     @torch.no_grad()
     def __call__(
         self,
-        rgb_in: Optional[torch.FloatTensor] = None,
-        disparity_in: Optional[torch.FloatTensor] = None,
+        disparity_cond: Optional[torch.FloatTensor] = None,
+        rgb_cond: Optional[torch.FloatTensor] = None,
         prompt: Union[str, List[str]] = None,
         num_inference_steps: int = 50,
         timesteps: List[int] = None,
@@ -1433,10 +1433,10 @@ class SDaIGControlNetPipeline(DirectDiffusionControlNetPipeline):
         The call function to the pipeline for generation.
 
         Args:
-            rgb_input (`torch.FloatTensor`):
-                Input RGB tensor, range [-1, 1].
-            disparity_in (`torch.FloatTensor`):
-                Input disparity tensor, range [-1, 1].
+            disparity_cond (`torch.FloatTensor`):
+                Disparity condition tensor, range [-1, 1].
+            rgb_cond (`torch.FloatTensor`, *optional*):
+                RGB condition tensor, range [-1, 1].
             prompt (`str` or `List[str]`, *optional*):
                 The prompt or prompts to guide image generation. If not defined, you need to pass `prompt_embeds`.
             num_inference_steps (`int`, *optional*, defaults to 50):
@@ -1502,24 +1502,18 @@ class SDaIGControlNetPipeline(DirectDiffusionControlNetPipeline):
         assert processing_res >= 0
 
         # 0. Image processing
-        input_size = rgb_in.shape
+        disparity_cond_size = disparity_cond.shape
         assert (
-            4 == rgb_in.dim() and 3 == input_size[-3]
-        ), f"Wrong input shape {input_size}, expected [B, 3, H, W]"
-        cond_size = disparity_in.shape
+            4 == disparity_cond.dim() and 1 == disparity_cond_size[-3]
+        ), f"Wrong input shape {disparity_cond_size}, expected [B, 3, H, W]"
+        rgb_cond_size = rgb_cond.shape
         assert (
-            4 == disparity_in.dim() and 1 == cond_size[-3]
-        ), f"Wrong input shape {cond_size}, expected [B, 3, H, W]"
+            4 == rgb_cond.dim() and 3 == rgb_cond_size[-3]
+        ), f"Wrong input shape {rgb_cond_size}, expected [B, 3, H, W]"
+
         # Resize image
-        resample_method: InterpolationMode = get_tv_resample_method(resample_method)
-        if processing_res > 0:
-            rgb_in = resize_max_res(
-                rgb_in,
-                max_edge_resolution=processing_res,
-                resample_method=resample_method,
-            )
         # 1. Default height and width to unet
-        height, width = rgb_in.shape[2:]
+        height, width = rgb_cond.shape[2:]
 
         controlnet = (
             self.controlnet._orig_mod
@@ -1552,7 +1546,7 @@ class SDaIGControlNetPipeline(DirectDiffusionControlNetPipeline):
             )
 
         # 2. Define call parameters
-        batch_size = rgb_in.shape[0]
+        batch_size = rgb_cond.shape[0]
         device = self._execution_device
         if isinstance(controlnet, MultiControlNetModel) and isinstance(
             controlnet_conditioning_scale, float
@@ -1572,15 +1566,15 @@ class SDaIGControlNetPipeline(DirectDiffusionControlNetPipeline):
 
         # 4. Prepare conditional image (should be preprared by dataset itself)
         assert (
-            rgb_in.shape[2:] == disparity_in.shape[2:]
-        ), f"Input image and condition image must have the same spatial dimensions, got {rgb_in.shape[2:]} and {disparity_in.shape[2:]}"
-
+            disparity_cond.shape[2:] == rgb_cond.shape[2:]
+        ), f"Condition images must have the same spatial dimensions, got {disparity_cond.shape[2:]} and {rgb_cond.shape[2:]}"
+        controlnet_cond = torch.cat([rgb_cond, disparity_cond], dim=1)
         # 5. Prepare timesteps
         timesteps = torch.tensor(timesteps, device=device).long()
         self._num_timesteps = len(timesteps)
 
         # 6. Prepare latent variables
-        num_channels_latents = self.unet.config.in_channels // 2
+        num_channels_latents = self.unet.config.in_channels
         latents = self.prepare_latents(
             batch_size,
             num_channels_latents,
@@ -1591,9 +1585,6 @@ class SDaIGControlNetPipeline(DirectDiffusionControlNetPipeline):
             generator,
             latents,
         )
-
-        rgb_latents = self.vae.encode(rgb_in.to(device)).latent_dist.sample()
-        rgb_latents = rgb_latents * self.vae.config.scaling_factor
 
         # 7. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
@@ -1623,7 +1614,6 @@ class SDaIGControlNetPipeline(DirectDiffusionControlNetPipeline):
                 ) and is_torch_higher_equal_2_1:
                     torch._inductor.cudagraph_mark_step_begin()
                 latent_model_input = self.scheduler.scale_model_input(latents, t)
-                latent_model_input = torch.cat([rgb_latents, latent_model_input], dim=1)
                 control_model_input = latent_model_input
                 controlnet_prompt_embeds = prompt_embeds
 
@@ -1671,7 +1661,9 @@ class SDaIGControlNetPipeline(DirectDiffusionControlNetPipeline):
                     encoder_hidden_states=torch.cat(
                         [controlnet_prompt_embeds, controlnet_prompt_embeds], dim=0
                     ),
-                    controlnet_cond=torch.cat([disparity_in, disparity_in], dim=0),
+                    controlnet_cond=torch.cat(
+                        [controlnet_cond, controlnet_cond], dim=0
+                    ),
                     conditioning_scale=cond_scale,
                     class_labels=torch.cat(
                         [depth_task_emb, recontruction_task_emb], dim=0
@@ -1725,7 +1717,6 @@ class SDaIGControlNetPipeline(DirectDiffusionControlNetPipeline):
             do_denormalize = [True] * image.shape[0]
         else:
             do_denormalize = [not has_nsfw for has_nsfw in has_nsfw_concept]
-
         image = self.image_processor.postprocess(
             image, output_type=output_type, do_denormalize=do_denormalize
         )
@@ -1740,7 +1731,7 @@ class SDaIGControlNetPipeline(DirectDiffusionControlNetPipeline):
                 if output_type == "pil"
                 else get_tv_resample_method("nearest")
             )
-            image = resize_back(image, input_size[-2:], resample_method)
+            image = resize_back(image, rgb_cond_size[-2:], resample_method)
 
         if not return_dict:
             return (image, has_nsfw_concept, latents)

@@ -1,5 +1,8 @@
-# datasets/__init__.py
-from datasets.NuScenes.NuScenes import SDaIGNuScenesDataset
+# data/__init__.py
+from data.NuScenes.NuScenes import (
+    SDaIGNuScenesTrainDataset,
+    SDaIGNuScenesTestDataset,
+)
 
 
 def build_dataset_from_cfg(cfg):
@@ -13,7 +16,9 @@ def build_dataset_from_cfg(cfg):
     """
     args = dict(cfg)
     dataset_type = args.pop("type")
-    if dataset_type == "SDaIGNuScenesDataset":
-        return SDaIGNuScenesDataset(**args)
+    if dataset_type == "SDaIGNuScenesTrainDataset":
+        return SDaIGNuScenesTrainDataset(**args)
+    elif dataset_type == "SDaIGNuScenesTestDataset":
+        return SDaIGNuScenesTestDataset(**args)
     else:
         raise KeyError(f"{dataset_type} is not a valid dataset type")

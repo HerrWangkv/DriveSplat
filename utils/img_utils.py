@@ -137,15 +137,17 @@ def set_inf_to_max(depth_maps):
     return depth_maps
 
 
-def concat_and_visualize_6_depths(depths: Tuple[torch.Tensor, ...], save_path="concat_6_depths.png"):
+def concat_and_visualize_6_depths(
+    depths: Tuple[torch.Tensor, ...], save_path="concat_6_depths.png", vmax=None
+):
     if isinstance(depths, torch.Tensor):
         depths = [depth.squeeze().detach().cpu().numpy() for depth in depths]
     elif isinstance(depths, np.ndarray):
         depths = [depth.squeeze() for depth in depths]
 
     fig, axes = plt.subplots(2, 3, figsize=(12, 4))
-    vmin = min([np.min(d) for d in depths])
-    vmax = max([np.max(d) for d in depths])
+    vmin = 0  # min([np.min(d) for d in depths])
+    vmax = max([np.max(d) for d in depths]) if vmax is None else vmax
 
     ims = []
     for i, ax in enumerate(axes.flat):

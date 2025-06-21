@@ -1,6 +1,7 @@
 import logging
 import os
 import argparse
+import logging
 from contextlib import nullcontext
 
 import torch
@@ -8,12 +9,18 @@ import numpy as np
 from tqdm.auto import tqdm
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
+from diffusers import UNet2DConditionModel
 from diffusers.models.controlnet import ControlNetModel
 from diffusers.utils import check_min_version
 
 from pipeline import SDaIGControlNetPipeline
-from datasets import build_dataset_from_cfg
-from utils.img_utils import concat_6_views, disparity2depth, concat_and_visualize_6_depths
+from data import build_dataset_from_cfg
+from utils.img_utils import (
+    concat_6_views,
+    disparity2depth,
+    concat_and_visualize_6_depths,
+    set_inf_to_max,
+)
 from utils.nvs_utils import render_novel_view
 from third_party.Lotus.utils.seed_all import seed_all
 
@@ -34,7 +41,7 @@ def parse_args():
     parser.add_argument(
         "--dataset_config",
         type=str,
-        default="datasets/NuScenes/sdaig.yaml",
+        default=None,
         help="Config file for the model.",
     )
     parser.add_argument(
@@ -132,7 +139,7 @@ def main():
 
     # -------------------- Data --------------------
     dataset_cfg = OmegaConf.load(args.dataset_config)
-    dataset = build_dataset_from_cfg(dataset_cfg.data.trainval)
+    dataset = build_dataset_from_cfg(dataset_cfg.data.val)
     dataloader = DataLoader(
         dataset,
         batch_size=1,
@@ -143,18 +150,61 @@ def main():
     )
     # -------------------- Model --------------------
 
-    pipeline = SDaIGControlNetPipeline.from_pretrained(
-        args.pretrained_model_name_or_path,
-        torch_dtype=dtype,
+    # Check if loading from a checkpoint directory with separate unet/controlnet folders
+    checkpoint_unet_path = os.path.join(args.pretrained_model_name_or_path, "unet")
+    checkpoint_controlnet_path = os.path.join(
+        args.pretrained_model_name_or_path, "controlnet"
     )
 
-    if pipeline.controlnet is None:
-        logging.info("Initializing ControlNet weights from unet")
-        pipeline.controlnet = ControlNetModel.from_unet(
-            pipeline.unet,
-            conditioning_channels=1
+    if os.path.exists(checkpoint_unet_path) and os.path.exists(
+        checkpoint_controlnet_path
+    ):
+        # Load base pipeline from original model (jingheya/lotus-depth-g-v2-1-disparity)
+        base_model_path = "jingheya/lotus-depth-g-v2-1-disparity"
+        logging.info(f"Loading base pipeline from {base_model_path}")
+        pipeline = SDaIGControlNetPipeline.from_pretrained(
+            base_model_path,
+            torch_dtype=dtype,
         )
-    logging.info(f"Successfully loading pipeline from {args.pretrained_model_name_or_path}.")
+
+        # Load fine-tuned UNet
+        logging.info(f"Loading fine-tuned UNet from {checkpoint_unet_path}")
+
+        fine_tuned_unet = UNet2DConditionModel.from_pretrained(
+            checkpoint_unet_path,
+            torch_dtype=dtype,
+        )
+        pipeline.unet = fine_tuned_unet
+
+        # Load fine-tuned ControlNet
+        logging.info(f"Loading fine-tuned ControlNet from {checkpoint_controlnet_path}")
+        fine_tuned_controlnet = ControlNetModel.from_pretrained(
+            checkpoint_controlnet_path,
+            torch_dtype=dtype,
+        )
+        pipeline.controlnet = fine_tuned_controlnet
+
+        logging.info(
+            f"Successfully loaded fine-tuned models from {args.pretrained_model_name_or_path}"
+        )
+    else:
+        # Loading from pretrained model (original behavior)
+        logging.info(
+            f"Loading pretrained pipeline from {args.pretrained_model_name_or_path}"
+        )
+        pipeline = SDaIGControlNetPipeline.from_pretrained(
+            args.pretrained_model_name_or_path,
+            torch_dtype=dtype,
+        )
+
+        if pipeline.controlnet is None:
+            logging.info("Initializing ControlNet weights from unet")
+            pipeline.controlnet = ControlNetModel.from_unet(
+                pipeline.unet, conditioning_channels=4
+            )
+        logging.info(
+            f"Successfully loading pipeline from {args.pretrained_model_name_or_path}."
+        )
     logging.info(f"processing_res = {processing_res or pipeline.default_processing_resolution}")
 
     pipeline = pipeline.to(device)
@@ -179,8 +229,8 @@ def main():
             with autocast_ctx:
                 # Run
                 preds = pipeline(
-                    rgb_in=data["pixel_values", 0][0],
-                    disparity_in=data["disparity_maps", 0][0],
+                    disparity_cond=data["box_disparity_maps", 0][0],
+                    rgb_cond=data["pixel_values", 0][0],
                     prompt=["" for _ in range(data["pixel_values", 0].shape[1])],
                     num_inference_steps=1,
                     generator=generator,
@@ -192,27 +242,36 @@ def main():
                     resample_method=resample_method,
                 ).images
 
-                disparity_out, rgb_out = np.split(preds, 2, axis=0)  # [6, H, W, 3]
+                disparity_out, rgb_out = np.split(
+                    preds, 2, axis=0
+                )  # [6, H, W, 3] #TODO inverse
                 disparity_out = disparity_out.mean(axis=-1)  # [B, H, W]
                 rgb_out = rgb_out.transpose(0, 3, 1, 2)  # [B, 3, H, W]
 
                 disparity_out[disparity_out < 0.005] = (
                     0.005  # Thresholding to remove noise
                 )
-                depth = disparity2depth(disparity_out)
+                depth_out = disparity2depth(disparity_out)
                 concat_and_visualize_6_depths(
-                    depth, 
-                    save_path=os.path.join(output_dir, f"{frame:04d}_depth.png")
+                    depth_out,
+                    save_path=os.path.join(output_dir, f"{frame:04d}_depth_out.png"),
+                )
+                disparity_gt = (data["disparity_maps", 0][0].cpu().numpy() + 1) / 2
+                depth_gt = disparity2depth(disparity_gt)
+                depth_gt = set_inf_to_max(depth_gt)
+                concat_and_visualize_6_depths(
+                    depth_gt,
+                    save_path=os.path.join(output_dir, f"{frame:04d}_depth_gt.png"),
                 )
                 concat_6_views(
                     (data["pixel_values", 0][0] + 1) / 2,  # Normalize to [0, 1]
-                ).save(os.path.join(output_dir, f"{frame:04d}_camera.png"))
+                ).save(os.path.join(output_dir, f"{frame:04d}_rgb_gt.png"))
                 concat_6_views(
                     rgb_out,
-                ).save(os.path.join(output_dir, f"{frame:04d}_rgb.png"))
+                ).save(os.path.join(output_dir, f"{frame:04d}_rgb_out.png"))
             novel_images, novel_depth = render_novel_view(
                 rgb_out,
-                depth,
+                depth_out,
                 data["ego_masks"][0].squeeze(),
                 data["intrinsics"][0],
                 data["extrinsics", 0][0],

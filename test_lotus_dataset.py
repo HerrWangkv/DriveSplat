@@ -3,13 +3,13 @@ import hydra
 
 @hydra.main(
     version_base=None,
-    config_path="datasets/NuScenes",
+    config_path="data/NuScenes",
     config_name="sdaig",
 )
 def main(cfg):
-    from datasets import build_dataset_from_cfg
+    from data import build_dataset_from_cfg
 
-    dataset = build_dataset_from_cfg(cfg.data.trainval)
+    dataset = build_dataset_from_cfg(cfg.data.train)
     dataset.vis(0)
     breakpoint()
 

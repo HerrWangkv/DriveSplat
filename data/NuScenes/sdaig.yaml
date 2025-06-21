@@ -1,5 +1,4 @@
 name: NuScenes
-dataset_type_nuscenes: SDaIGNuScenesDataset
 nuscenes_version: v1.0-mini
 dataroot: /storage_local/kwang/nuscenes/raw/
 cache: /storage_local/kwang/nuscenes/cache/
@@ -18,7 +17,7 @@ cameras:
 
 data:
   trainval:
-    type: ${...dataset_type_nuscenes}
+    type: SDaIGNuScenesTrainDataset
     version: v1.0-trainval
     dataroot: ${...dataroot}
     cache_dir: ${...cache}
@@ -28,7 +27,7 @@ data:
     height: ${...height}
     width: ${...width}
   train:
-    type: ${...dataset_type_nuscenes}
+    type: SDaIGNuScenesTrainDataset
     version: v1.0-trainval
     dataroot: ${...dataroot}
     cache_dir: ${...cache}
@@ -38,21 +37,11 @@ data:
     height: ${...height}
     width: ${...width}
   val:
-    type: ${...dataset_type_nuscenes}
+    type: SDaIGNuScenesTestDataset
     version: v1.0-trainval
     dataroot: ${...dataroot}
     cache_dir: ${...cache}
     split: "val"
-    view_order: ${...cameras}
-    N: ${...interpolated_frame_between_keyframes}
-    height: ${...height}
-    width: ${...width}
-  inference:
-    type: ${...dataset_type_nuscenes}
-    version: ${...nuscenes_version}
-    dataroot: ${...dataroot}
-    cache_dir: ${...cache}
-    split: ${...scene_idx}
     view_order: ${...cameras}
     N: ${...interpolated_frame_between_keyframes}
     height: ${...height}

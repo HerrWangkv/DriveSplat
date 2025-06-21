@@ -41,12 +41,12 @@ def depth_to_pointcloud(depth: torch.Tensor,
     else:
         batch_size = depth.shape[0]
         squeeze_output = False
-    
+
     if intrinsics.dim() == 2:
         intrinsics = intrinsics.unsqueeze(0).expand(batch_size, -1, -1)
     if extrinsics.dim() == 2:
         extrinsics = extrinsics.unsqueeze(0).expand(batch_size, -1, -1)
-    
+
     # Handle ego mask dimensions
     if ego_mask is not None:
         if ego_mask.dim() == 2:
@@ -54,53 +54,53 @@ def depth_to_pointcloud(depth: torch.Tensor,
         elif ego_mask.dim() == 3 and ego_mask.shape[0] != batch_size:
             # If ego_mask has different batch size, broadcast it
             ego_mask = ego_mask.expand(batch_size, -1, -1)
-    
+
     device = depth.device
     H, W = depth.shape[-2:]
-    
+
     # Create pixel coordinates
     y, x = torch.meshgrid(torch.arange(H, device=device), 
                          torch.arange(W, device=device), indexing='ij')
     x = x.float()
     y = y.float()
-    
+
     # Convert to homogeneous coordinates
     ones = torch.ones_like(x)
     pixel_coords = torch.stack([x, y, ones], dim=-1)  # (H, W, 3)
     pixel_coords = pixel_coords.unsqueeze(0).expand(batch_size, -1, -1, -1)  # (B, H, W, 3)
-    
+
     # Get valid depth points (non-zero depth values and not in ego mask)
     valid_mask = depth > 0
     if ego_mask is not None:
         # Filter out ego mask pixels (ego_mask=True means ego pixels to be filtered out)
         valid_mask = valid_mask & (~ego_mask.bool())
-    
+
     points_list = []
     colors_list = []
-    
+
     for b in range(batch_size):
         valid_pixels = pixel_coords[b][valid_mask[b]]  # (N_valid, 3)
         valid_depths = depth[b][valid_mask[b]]  # (N_valid,)
-        
+
         if len(valid_pixels) == 0:
             # Handle case with no valid depth points
             points_list.append(torch.zeros((0, 3), device=device))
             if rgb is not None:
                 colors_list.append(torch.zeros((0, 3), device=device))
             continue
-        
+
         # Convert pixel coordinates to camera coordinates
         K_inv = torch.inverse(intrinsics[b])
         cam_coords = torch.matmul(valid_pixels, K_inv.T)  # (N_valid, 3)
         cam_coords = cam_coords * valid_depths.unsqueeze(-1)  # Scale by depth
-        
+
         # Convert to homogeneous coordinates
         cam_coords_homo = torch.cat([cam_coords, torch.ones(cam_coords.shape[0], 1, device=device)], dim=-1)
-        
+
         # Transform to world coordinates
         world_coords = torch.matmul(cam_coords_homo, torch.inverse(extrinsics[b]).T)
         points_list.append(world_coords[:, :3])
-        
+
         # Extract colors if provided
         if rgb is not None:
             # Handle batch dimension for RGB
@@ -118,11 +118,11 @@ def depth_to_pointcloud(depth: torch.Tensor,
                 rgb_batch = rgb
                 if rgb_batch.dim() == 3:  # (H, W, C) -> (1, H, W, C)
                     rgb_batch = rgb_batch.unsqueeze(0)
-            
+
             # Now rgb_batch should be in (B, H, W, C) format
             valid_colors = rgb_batch[b][valid_mask[b]]  # (N_valid, 3)
             colors_list.append(valid_colors)
-    
+
     # Concatenate results
     if squeeze_output and batch_size == 1:
         points = points_list[0]
@@ -138,23 +138,23 @@ def depth_to_pointcloud(depth: torch.Tensor,
         else:
             points = torch.zeros((0, 3), device=device)
             colors = torch.zeros((0, 3), device=device) if rgb is not None else None
-    
+
     return points, colors
 
-def paste_ego_area(current_images: torch.Tensor,
-                  current_depths: torch.Tensor,
-                  current_ego_mask: torch.Tensor,
-                  novel_images: torch.Tensor,
-                  novel_depths: torch.Tensor,
-):  
-    novel_images = torch.where(current_ego_mask.bool().unsqueeze(-1), 
-                              current_images, 
-                              novel_images)
-    novel_depths = torch.where(current_ego_mask.bool(), 
-                              current_depths, 
-                              novel_depths)
 
-    return novel_images, novel_depths
+def paste_ego_area(
+    current: torch.Tensor,
+    current_ego_mask: torch.Tensor,
+    novel: torch.Tensor,
+):
+    if current.dim() == 3:
+        novel = torch.where(current_ego_mask.bool(), current, novel)
+    elif current.dim() == 4:
+        novel = torch.where(current_ego_mask.bool().unsqueeze(-1), current, novel)
+    else:
+        raise ValueError("Unsupported tensor dimensions for pasting ego area")
+
+    return novel
 
 
 def render_novel_view(current_images: Union[torch.Tensor, np.ndarray],
@@ -318,7 +318,9 @@ def render_novel_view(current_images: Union[torch.Tensor, np.ndarray],
     valid_depth_mask = zbuf > 0
 
     # Initialize depth maps
-    novel_depths = torch.zeros(batch_size, *image_size, device=device)
+    novel_depths = torch.ones(batch_size, *image_size, device=device) * float(
+        "inf"
+    )  # Set to inf initially
 
     # Set depth values where valid
     novel_depths[valid_depth_mask] = zbuf[valid_depth_mask]
@@ -327,7 +329,7 @@ def render_novel_view(current_images: Union[torch.Tensor, np.ndarray],
         novel_images = novel_images.squeeze(0)
         novel_depths = novel_depths.squeeze(0)
 
-    return paste_ego_area(current_images, current_depths, current_ego_mask, novel_images, novel_depths)
+    return paste_ego_area(current_images, current_ego_mask, novel_images), novel_depths
 
 
 def create_camera_matrices(fx: float, fy: float, cx: float, cy: float,

@@ -17,7 +17,7 @@ from tqdm import tqdm
 import sys
 # Add the project root directory to the Python path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
-from datasets.utils.box_depth_projection import BoxDepthProjector
+from data.utils.box_depth_projection import BoxDepthProjector
 from utils.img_utils import (
     concat_6_views,
     depth2disparity,
@@ -694,6 +694,84 @@ class NuScenesBase(NuScenes):
         return camera_params
 
 
+class NuScenesLidarDisparity(Dataset):
+    def __init__(self, nusc, img_size):
+        """
+        Lidar disparity map
+
+        Args:
+            nusc: NuScenesBase instance
+            height (int): Height of the disparity map
+            width (int): Width of the disparity map
+        """
+        super().__init__()
+        self.nusc = nusc
+        self.img_size = img_size
+
+    def __len__(self):
+        return len(self.nusc.lidar_data_tokens)
+
+    def __getitem__(self, index):
+        lidar_token = self.nusc.lidar_data_tokens[index]
+        lidar_data = self.nusc.get("sample_data", lidar_token)
+        lidar_points = np.fromfile(
+            os.path.join(self.nusc.dataroot, lidar_data["filename"]), dtype=np.float32
+        ).reshape(-1, 5)[
+            :, :3
+        ]  # Extract x, y, z coordinates
+
+        disparity_maps = []
+        for cam in self.nusc.cameras:
+            cam_idx = self.nusc.cameras[cam]
+            calib_token = self.nusc.camera_calib_tokens[cam_idx][index]
+            calib_data = self.nusc.get("calibrated_sensor", calib_token)
+            camera_intrinsics = np.array(calib_data["camera_intrinsic"])
+            camera_intrinsics[0] *= self.img_size[1] / 1600
+            camera_intrinsics[1] *= self.img_size[0] / 900
+            lidar_to_cam = self.nusc.get_lidar_to_cam(index, cam)
+
+            # Transform lidar points to camera frame
+            lidar_points_h = np.hstack(
+                (lidar_points, np.ones((lidar_points.shape[0], 1)))
+            )
+            points_in_cam = lidar_points_h @ lidar_to_cam.T
+            depth = points_in_cam[:, 2]  # Extract depth values
+
+            # Project points onto the image plane
+            front_mask = points_in_cam[:, 2] > 0  # Keep points in front
+            points_in_cam = points_in_cam[front_mask]
+            depth = depth[front_mask]
+            points_in_img = points_in_cam[:, :3] @ camera_intrinsics.T
+            points_in_img = points_in_img[:, :2] / points_in_img[:, 2:3]  # Normalize
+            points_in_img = np.round(points_in_img)
+
+            # Filter points within image bounds
+            img_width, img_height = self.img_size[1], self.img_size[0]
+            valid_mask = (
+                (points_in_img[:, 0] >= 0)
+                & (points_in_img[:, 0] < img_width)
+                & (points_in_img[:, 1] >= 0)
+                & (points_in_img[:, 1] < img_height)
+            )
+            # Create an empty image with the same size as the target image
+            img_width, img_height = self.img_size[1], self.img_size[0]
+            disparity_image = np.zeros((img_height, img_width))
+
+            # Round the coordinates to integers for indexing
+            points_in_img = points_in_img[valid_mask]
+            depth = depth[valid_mask]
+            x_coords = points_in_img[:, 0].astype(int)
+            y_coords = points_in_img[:, 1].astype(int)
+
+            # Assign depth values to the corresponding pixel locations
+            disparity_image[y_coords, x_coords] = 1 / depth
+
+            # Add the depth image to the projected points
+            disparity_maps.append(torch.tensor(disparity_image).unsqueeze(0).float())
+        disparity_maps = torch.stack(disparity_maps, axis=0)
+        return {"lidar_disparity_maps": disparity_maps}
+
+
 class NuScenesBoxDisparity(Dataset):
     def __init__(self, nusc, img_size):
         """
@@ -747,7 +825,8 @@ class NuScenesDisparity(Dataset):
         return len(self.nusc.lidar_data_tokens)
 
     def __getitem__(self, index):
-        scene_idx, frame_idx = self.nusc.seq_indices[index]
+        seq_idx, frame_idx = self.nusc.seq_indices[index]
+        scene_idx = self.nusc.seqs[seq_idx]
         disparity_dir = os.path.join(
             self.nusc.cache_dir, "disparity", f"{scene_idx:03d}"
         )
@@ -882,6 +961,8 @@ class SDaIGNuScenesDataset(Dataset):
     def is_last_frame(self, index):
         return self.nusc.is_last_frame(index)
 
+
+class SDaIGNuScenesTrainDataset(SDaIGNuScenesDataset):
     def __getitem__(self, index):
         interval = 1 if not self.is_last_frame(index) else -1
         ret = {}
@@ -890,9 +971,6 @@ class SDaIGNuScenesDataset(Dataset):
         )  # Normalize to [-1, 1]
         ret["pixel_values", 1] = (
             self.pixel_values[index + interval]["pixel_values"] * 2 - 1
-        )  # Normalize to [-1, 1]
-        ret["box_disparity_maps", 0] = (
-            self.box_disparity_maps[index]["box_disparity_maps"] * 2 - 1
         )  # Normalize to [-1, 1]
         ret["box_disparity_maps", 1] = (
             self.box_disparity_maps[index + interval]["box_disparity_maps"] * 2 - 1
@@ -922,30 +1000,68 @@ class SDaIGNuScenesDataset(Dataset):
         ret["extrinsics", 1] = torch.stack(extrinsics1, dim=0)
         return {k: v.cpu().to(torch.float32) for k, v in ret.items()}
 
+
+class SDaIGNuScenesTestDataset(SDaIGNuScenesDataset):
+    def __getitem__(self, index):
+        interval = 1 if not self.is_last_frame(index) else -1
+        ret = {}
+        ret["pixel_values", 0] = (
+            self.pixel_values[index]["pixel_values"] * 2 - 1
+        )  # Normalize to [-1, 1]
+        ret["pixel_values", 1] = (
+            self.pixel_values[index + interval]["pixel_values"] * 2 - 1
+        )  # Normalize to [-1, 1]
+        ret["box_disparity_maps", 0] = (
+            self.box_disparity_maps[index]["box_disparity_maps"] * 2 - 1
+        )  # Normalize to [-1, 1]
+        ret["disparity_maps", 0] = (
+            self.disparity_maps[index]["disparity_maps"] * 2 - 1
+        )  # Normalize to [-1, 1]
+        ret["disparity_maps", 1] = (
+            self.disparity_maps[index + interval]["disparity_maps"] * 2 - 1
+        )  # Normalize to [-1, 1]
+        ret["ego_masks"] = self.ego_masks[index]["ego_masks"]
+        intrinsics = []
+        extrinsics0 = []
+        extrinsics1 = []
+        for cam in self.nusc.cameras:
+            intrinsics.append(
+                torch.tensor(
+                    self.nusc.get_camera_intrinsics(index, cam, img_size=self.img_size)
+                )
+            )
+            extrinsics0.append(torch.tensor(self.nusc.get_world_to_cam(index, cam)))
+            extrinsics1.append(
+                torch.tensor(self.nusc.get_world_to_cam(index + interval, cam))
+            )
+        ret["intrinsics"] = torch.stack(intrinsics, dim=0)
+        ret["extrinsics", 0] = torch.stack(extrinsics0, dim=0)
+        ret["extrinsics", 1] = torch.stack(extrinsics1, dim=0)
+        return {k: v.cpu().to(torch.float32) for k, v in ret.items()}
+
     def vis(self, index):
+        os.makedirs("vis", exist_ok=True)
         item = self[index]
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         item = {k: v.to(device) for k, v in item.items()}
-        box_disparity_maps = (
+        cond_disparity_maps = (
             item["box_disparity_maps", 0] + 1
         ) / 2  # Normalize to [0, 1]
-        disparity_maps = (item["disparity_maps", 0] + 1) / 2  # Normalize to [0, 1]
+        cond_depth_maps = disparity2depth(cond_disparity_maps)
+        concat_and_visualize_6_depths(
+            set_inf_to_max(cond_depth_maps), save_path="vis/cond_depth_maps.png"
+        )
         pixel_values = (item["pixel_values", 0] + 1) / 2  # Normalize to [0, 1]
         ego_masks = item["ego_masks"]
-        pixel_values *= 1 - ego_masks
-        concated_pixel_values = concat_6_views(pixel_values)
-        concated_pixel_values.save(f"concated_pixel_values.png")
-        box_depth_maps = disparity2depth(box_disparity_maps)
-        box_depth_maps = set_inf_to_max(box_depth_maps)
-        concat_and_visualize_6_depths(box_depth_maps, f"concated_box_depth_maps.png")
+        concat_6_views(pixel_values * (1 - ego_masks)).save(f"vis/pixel_values.png")
+        disparity_maps = (item["disparity_maps", 0] + 1) / 2  # Normalize to [0, 1]
         depth_maps = disparity2depth(disparity_maps)
-        depth_maps = set_inf_to_max(depth_maps)
 
-        concat_and_visualize_6_depths(depth_maps, f"concated_depth_maps.png")
+        concat_and_visualize_6_depths(set_inf_to_max(depth_maps), f"vis/depth_maps.png")
         with torch.no_grad():
             novel_images, novel_depth = render_novel_view(
                 pixel_values,
-                depth_maps.squeeze(),
+                set_inf_to_max(depth_maps).squeeze(),
                 ego_masks.squeeze(),
                 item["intrinsics"],
                 item["extrinsics", 0],
@@ -955,14 +1071,16 @@ class SDaIGNuScenesDataset(Dataset):
             )
         concat_6_views(
             novel_images.squeeze().permute([0, 3, 1, 2]),
-        ).save("predicted_novel_view.png")
+        ).save("vis/predicted_novel_view.png")
         concat_and_visualize_6_depths(
-            novel_depth, save_path="predicted_novel_view_depth.png"
+            set_inf_to_max(novel_depth), save_path="vis/predicted_novel_view_depth.png"
         )
 
         next_disparity_maps = (item["disparity_maps", 1] + 1) / 2  # Normalize to [0, 1]
-        next_pixel_values = (item["pixel_values", 1] + 1) / 2  # Normalize to [0, 1]
-        concat_6_views(next_pixel_values).save("real_novel_view.png")
+        next_depth_maps = disparity2depth(next_disparity_maps)
         concat_and_visualize_6_depths(
-            disparity2depth(next_disparity_maps), save_path="real_novel_view_depth.png"
+            set_inf_to_max(next_depth_maps),
+            save_path="vis/real_novel_view_depth.png",
         )
+        next_pixel_values = (item["pixel_values", 1] + 1) / 2  # Normalize to [0, 1]
+        concat_6_views(next_pixel_values).save("vis/real_novel_view.png")
