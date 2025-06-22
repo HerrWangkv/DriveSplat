@@ -74,7 +74,7 @@ logger = get_logger(__name__, log_level="INFO")
 
 
 @torch.no_grad()
-def run_example_inference(pipeline, batch, args, step, generator):
+def run_example_validation(pipeline, batch, args, step, generator):
     disparity_gt = (batch["disparity_maps", 1][0].cpu().numpy() + 1) / 2
     depth_gt = disparity2depth(disparity_gt)
     depth_gt = set_inf_to_max(depth_gt)
@@ -90,16 +90,28 @@ def run_example_inference(pipeline, batch, args, step, generator):
     else:
         autocast_ctx = torch.autocast(pipeline.device.type)
     with autocast_ctx:
-        # Run
-        preds = pipeline(
-            disparity_cond=batch["box_disparity_maps", 1][0],
-            rgb_cond=batch["pixel_values", 1][0],
-            prompt=["" for _ in range(batch["pixel_values", 1].shape[1])],
-            num_inference_steps=1,
-            generator=generator,
-            output_type="np",
-            timesteps=[args.timestep],
-        ).images
+        # Run inference with appropriate parameters based on training mode
+        if args.multi_step_training:
+            # Multi-step inference with proper denoising steps
+            preds = pipeline(
+                disparity_cond=batch["box_disparity_maps", 1][0],
+                rgb_cond=batch["pixel_values", 1][0],
+                prompt=["" for _ in range(batch["pixel_values", 1].shape[1])],
+                num_inference_steps=args.num_inference_steps,
+                generator=generator,
+                output_type="np",
+            ).images
+        else:
+            # Single-step inference
+            preds = pipeline(
+                disparity_cond=batch["box_disparity_maps", 1][0],
+                rgb_cond=batch["pixel_values", 1][0],
+                prompt=["" for _ in range(batch["pixel_values", 1].shape[1])],
+                num_inference_steps=1,
+                generator=generator,
+                output_type="np",
+                timesteps=[args.timestep],
+            ).images
         disparity_out, rgb_out = np.split(preds, 2, axis=0)  # [6, H, W, 3]
         disparity_out = disparity_out.mean(axis=-1)  # [B, H, W]
 
@@ -115,7 +127,7 @@ def run_example_inference(pipeline, batch, args, step, generator):
         ).save(os.path.join(args.output_dir, f"{step}_rgb_out.png"))
 
 
-def log_inference(
+def log_validation(
     batch,
     vae,
     text_encoder,
@@ -127,25 +139,31 @@ def log_inference(
     weight_dtype,
     step,
 ):
-    logger.info("Running inference")
+    logger.info("Running validation")
+    
+    # Create scheduler
     scheduler = DDIMScheduler.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="scheduler"
     )
     scheduler.register_to_config(prediction_type=args.prediction_type)
-    pipeline = SDaIGControlNetPipeline.from_pretrained(
-        args.pretrained_model_name_or_path,
-        scheduler=scheduler,
+    
+    # Create pipeline directly with our trained components
+    # Since the base model doesn't have ControlNet, we skip loading from pretrained
+    pipeline = SDaIGControlNetPipeline(
         vae=accelerator.unwrap_model(vae),
         text_encoder=accelerator.unwrap_model(text_encoder),
         tokenizer=tokenizer,
         unet=accelerator.unwrap_model(unet),
         controlnet=accelerator.unwrap_model(controlnet),
-        revision=args.revision,
-        variant=args.variant,
-        torch_dtype=weight_dtype,
+        scheduler=scheduler,
+        safety_checker=None,
+        feature_extractor=None,
+        requires_safety_checker=False,
     )
+    
     pipeline = pipeline.to(accelerator.device)
     pipeline.set_progress_bar_config(disable=True)
+    
     if args.enable_xformers_memory_efficient_attention:
         if is_xformers_available():
             pipeline.enable_xformers_memory_efficient_attention()
@@ -153,11 +171,13 @@ def log_inference(
             raise ValueError(
                 "xformers is not available. Make sure it is installed correctly"
             )
+    
     if args.seed is None:
         generator = None
     else:
         generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
-    run_example_inference(pipeline, batch, args, step, generator)
+    
+    run_example_validation(pipeline, batch, args, step, generator)
     del pipeline
     torch.cuda.empty_cache()
 
@@ -237,13 +257,31 @@ def parse_args():
     parser.add_argument(
         "--timestep",
         type=int,
-        default=1
+        default=1,
+        help="Fixed timestep for single-step training. Set to None for multi-step training.",
     )
     parser.add_argument(
-        "--inference_steps",
+        "--max_timesteps",
+        type=int,
+        default=1000,
+        help="Maximum timesteps for multi-step diffusion training.",
+    )
+    parser.add_argument(
+        "--multi_step_training",
+        action="store_true",
+        help="Enable multi-step diffusion training with random timestep sampling.",
+    )
+    parser.add_argument(
+        "--num_inference_steps",
+        type=int,
+        default=20,
+        help="Number of inference steps to use during validation when multi-step training is enabled.",
+    )
+    parser.add_argument(
+        "--validation_steps",
         type=int,
         default=500,
-        help="Run inference every X steps.",
+        help="Run validation every X steps.",
     )
     parser.add_argument(
         "--gradient_accumulation_steps",
@@ -753,7 +791,12 @@ def main():
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
-    logger.info(f"  Unet timestep = {args.timestep}")
+    if args.multi_step_training:
+        logger.info(
+            f"  Training mode: Multi-step diffusion (max timesteps: {args.max_timesteps})"
+        )
+    else:
+        logger.info(f"  Training mode: Single-step (fixed timestep: {args.timestep})")
     logger.info(f"Output Workspace: {args.output_dir}")
 
     global_step = 0
@@ -869,9 +912,19 @@ def main():
                     new_rgb_noise = rgb_noise + args.input_perturbation * torch.randn_like(rgb_noise)
                     new_disparity_noise = disparity_noise + args.input_perturbation * torch.randn_like(disparity_noise)
 
-                # Set timestep
-                timesteps = torch.tensor([args.timestep], device=disparity_latents.device).repeat(bsz)
-                timesteps = timesteps.long()
+                # Set timesteps for training
+                if args.multi_step_training:
+                    # Random timestep sampling for multi-step training
+                    timesteps = torch.randint(
+                        0, args.max_timesteps, (bsz,), device=disparity_latents.device
+                    )
+                    timesteps = timesteps.long()
+                else:
+                    # Fixed timestep for single-step training
+                    timesteps = torch.tensor(
+                        [args.timestep], device=disparity_latents.device
+                    ).repeat(bsz)
+                    timesteps = timesteps.long()
 
                 # Add noise to the latents according to the noise magnitude at each timestep
                 # (this is the forward diffusion process)
@@ -983,7 +1036,7 @@ def main():
                 log_rgb_loss = 0.0
 
                 checkpointing_steps = args.checkpointing_steps
-                inference_steps = args.inference_steps
+                validation_steps = args.validation_steps
 
                 if accelerator.is_main_process:
                     if global_step % checkpointing_steps == 0:
@@ -1012,8 +1065,8 @@ def main():
                         logger.info(f"Saved state to {save_path}")
                         torch.cuda.empty_cache()
 
-                    if global_step % inference_steps == 0:
-                        log_inference(
+                    if global_step % validation_steps == 0:
+                        log_validation(
                             batch,
                             vae,
                             text_encoder,

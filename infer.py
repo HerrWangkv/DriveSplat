@@ -139,7 +139,7 @@ def main():
 
     # -------------------- Data --------------------
     dataset_cfg = OmegaConf.load(args.dataset_config)
-    dataset = build_dataset_from_cfg(dataset_cfg.data.val)
+    dataset = build_dataset_from_cfg(dataset_cfg.data.inference)
     dataloader = DataLoader(
         dataset,
         batch_size=1,
@@ -282,10 +282,10 @@ def main():
             novel_depth[novel_depth > 200] = 200  # Thresholding to remove noise
             concat_6_views(
                 novel_images.squeeze().permute([0, 3, 1, 2]),
-            ).save(os.path.join(output_dir, f"{frame:04d}_novel_view.png"))
+            ).save(os.path.join(output_dir, f"{frame+1:04d}_rgb_pred.png"))
             concat_and_visualize_6_depths(
                 novel_depth,
-                save_path=os.path.join(output_dir, f"{frame:04d}_novel_view_depth.png"),
+                save_path=os.path.join(output_dir, f"{frame+1:04d}_depth_pred.png"),
             )
             breakpoint()
             torch.cuda.empty_cache()

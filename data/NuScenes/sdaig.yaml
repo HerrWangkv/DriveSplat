@@ -46,3 +46,13 @@ data:
     N: ${...interpolated_frame_between_keyframes}
     height: ${...height}
     width: ${...width}
+  inference:
+    type: SDaIGNuScenesTestDataset
+    version: v1.0-trainval
+    dataroot: ${...dataroot}
+    cache_dir: ${...cache}
+    split: 219
+    view_order: ${...cameras}
+    N: ${...interpolated_frame_between_keyframes}
+    height: ${...height}
+    width: ${...width}

@@ -1,7 +1,7 @@
 
 export CUDA=0
 
-export CHECKPOINT_DIR="output/train-sdaig-bsz8/checkpoint-3500"
+export CHECKPOINT_DIR="output/train-sdaig-bsz8/checkpoint-20000"
 export OUTPUT_DIR="output/Depth_G_Infer"
 export DATASET_CONFIG="data/NuScenes/sdaig.yaml"
 
