@@ -157,17 +157,20 @@ def paste_ego_area(
     return novel
 
 
-def render_novel_view(current_images: Union[torch.Tensor, np.ndarray],
-                     current_depths: Union[torch.Tensor, np.ndarray],
-                     current_ego_mask: torch.Tensor,
-                     current_intrinsics: torch.Tensor,
-                     current_extrinsics: torch.Tensor,
-                     novel_intrinsics: torch.Tensor,
-                     novel_extrinsics: torch.Tensor,
-                     image_size: Tuple[int, int] = (512, 512),
-                     point_radius: float = 0.01,
-                     points_per_pixel: int = 8,
-                     background_color: Tuple[float, float, float] = (0.0, 0.0, 0.0)) -> Tuple[torch.Tensor, torch.Tensor]:
+def render_novel_view(
+    current_images: Union[torch.Tensor, np.ndarray],
+    current_depths: Union[torch.Tensor, np.ndarray],
+    current_ego_mask: torch.Tensor,
+    current_intrinsics: torch.Tensor,
+    current_extrinsics: torch.Tensor,
+    novel_intrinsics: torch.Tensor,
+    novel_extrinsics: torch.Tensor,
+    image_size: Tuple[int, int] = (512, 512),
+    point_radius: float = 0.01,
+    points_per_pixel: int = 8,
+    background_color: Tuple[float, float, float] = (0.0, 0.0, 0.0),
+    render_depth: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Render novel view using PyTorch3D point cloud rendering.
 
@@ -306,7 +309,8 @@ def render_novel_view(current_images: Union[torch.Tensor, np.ndarray],
 
     # Extract RGB and depth
     novel_images = rendered[..., :3]  # (B, H, W, 3)
-
+    if not render_depth:
+        return paste_ego_area(current_images, current_ego_mask, novel_images)
     # Extract depth from rasterizer's z-buffer
     # The rasterizer provides depth information through its fragments
     # Re-rasterize to get fragments with depth information
