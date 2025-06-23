@@ -27,4 +27,3 @@ transformers==4.40.1
 omegaconf==2.3.0
 nuscenes-devkit==1.1.9
 wandb==0.20.1
-git+https://github.com/facebookresearch/pytorch3d.git
