@@ -1,5 +1,12 @@
+## Docker Build
+```bash
+docker build -t drivesplat .
 ```
-conda create -n drivesplat python=3.10 -y
-conda activate drivesplat
-pip install -r requirements.txt 
+
+## Apptainer Build
+```bash
+apptainer build drivesplat.sif docker://your-dockerhub-username/drivesplat:latest
 ```
+
+## Running the Container
+### Apptainer
