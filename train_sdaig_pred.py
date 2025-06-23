@@ -88,8 +88,11 @@ def run_example_validation(pipeline, batch, args, step, generator):
         batch["extrinsics", 1].squeeze(),
         (dataset_cfg.height, dataset_cfg.width),
         render_depth=False)
-    
+
     pixel_values_rendered = pixel_values_rendered.permute([0,3,1,2])  # [6, H, W, 3] -> [6, 3, H, W]
+    concat_6_views(pixel_values_rendered).save(
+        os.path.join(args.output_dir, f"{step}_rgb_cond.png")
+    )
     disparity_gt = (batch["disparity_maps", 1][0].cpu().numpy() + 1) / 2
     depth_gt = disparity2depth(disparity_gt)
     depth_gt = set_inf_to_max(depth_gt)
