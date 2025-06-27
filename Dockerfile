@@ -50,7 +50,7 @@ RUN pip install git+https://github.com/facebookresearch/pytorch3d.git
 RUN rm requirements.txt
 
 # Install squashfuse
-RUN apt-get update && apt-get install -y squashfuse && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y squashfuse fuse && rm -rf /var/lib/apt/lists/*
 
 # Copy the rest of the application
 COPY . .
