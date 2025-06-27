@@ -41,7 +41,9 @@ COPY requirements.txt .
 # Install Python dependencies from requirements.txt
 RUN pip install -r requirements.txt
 
-# Install PyTorch3D from GitHub
+# Install PyTorch3D from source to support all GPU architectures
+ENV FORCE_CUDA=1
+ENV TORCH_CUDA_ARCH_LIST="6.0;6.1;7.0;7.5;8.0;8.6;8.9;9.0"
 RUN pip install git+https://github.com/facebookresearch/pytorch3d.git
 
 # Remove the copied requirements.txt file
