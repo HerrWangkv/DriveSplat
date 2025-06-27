@@ -1,0 +1,101 @@
+#!/bin/bash
+
+# The data directories are now mounted by the SLURM script
+# Just verify they exist
+if [ ! -d "/data/raw" ]; then
+    echo "Error: /data/raw not found. SquashFS mount may have failed."
+    exit 1
+fi
+
+if [ ! -d "/data/cache" ]; then
+    echo "Warning: /data/cache not found. Cache SquashFS may not be available."
+fi
+
+echo "Data directories are available:"
+ls -la /data/
+
+export MODEL_NAME="jingheya/lotus-depth-g-v2-1-disparity"
+
+# training dataset
+export DATASET_CONFIG_PATH="data/NuScenes/sdaig.yaml"
+
+# training configs
+export BATCH_SIZE=1
+export GAS=1
+export TOTAL_BSZ=$(($BATCH_SIZE * 8 * $GAS))  # 8 GPUs total across 2 nodes (4 per node)
+
+# model configs for multi-step training
+export MAX_TIMESTEPS=1000
+export VAL_STEP=500
+export NUM_INFERENCE_STEPS=20  # Number of denoising steps during validation
+
+# output dir
+export OUTPUT_DIR="output/train-sdaig-pred-multistep-bsz${TOTAL_BSZ}/"
+
+# Set machine rank based on hostname
+current_hostname=$(hostname -s)
+echo "Current hostname: $current_hostname"
+echo "SLURM_JOB_NODELIST: $SLURM_JOB_NODELIST"
+
+# Simple hostname-based ranking for known nodes
+if [[ "$current_hostname" == "hkn0401" ]]; then
+    export MACHINE_RANK=0
+elif [[ "$current_hostname" == "hkn0402" ]]; then
+    export MACHINE_RANK=1
+else
+    # Fallback: extract node number and use modulo
+    if [[ "$current_hostname" =~ hkn([0-9]+) ]]; then
+        node_num=${BASH_REMATCH[1]}
+        # For 2-node setup, use modulo 2
+        export MACHINE_RANK=$((node_num % 2))
+    else
+        export MACHINE_RANK=0
+    fi
+fi
+
+echo "Current hostname: $(hostname -s)"
+echo "SLURM_JOB_NODELIST: $SLURM_JOB_NODELIST"
+echo "Machine rank: $MACHINE_RANK"
+echo "Master address: $MASTER_ADDR"
+echo "Master port: $MASTER_PORT"
+echo "SLURM_PROCID: $SLURM_PROCID"
+echo "SLURM_LOCALID: $SLURM_LOCALID"
+echo "SLURM_NODEID: $SLURM_NODEID"
+echo "SLURM_NODEID: $SLURM_NODEID"
+
+# Test network connectivity
+if [ "$MACHINE_RANK" != "0" ]; then
+    echo "Testing connectivity to master node..."
+    nc -z $MASTER_ADDR $MASTER_PORT
+    echo "Network test exit code: $?"
+fi
+
+# Use accelerate launch with simplified multi-node configuration
+timeout 1800 accelerate launch \
+  --multi_gpu \
+  --mixed_precision="fp16" \
+  --num_machines=2 \
+  --num_processes=8 \
+  --machine_rank=$MACHINE_RANK \
+  --main_process_ip=$MASTER_ADDR \
+  --main_process_port=$MASTER_PORT \
+  train_sdaig_pred.py \
+  --pretrained_model_name_or_path=$MODEL_NAME \
+  --dataset_config_path=$DATASET_CONFIG_PATH \
+  --dataloader_num_workers=0 \
+  --train_batch_size=$BATCH_SIZE \
+  --gradient_accumulation_steps=$GAS \
+  --gradient_checkpointing \
+  --max_grad_norm=1 \
+  --seed=42 \
+  --max_train_steps=20000 \
+  --learning_rate=3e-05 \
+  --lr_scheduler="constant" --lr_warmup_steps=0 \
+  --multi_step_training \
+  --max_timesteps=$MAX_TIMESTEPS \
+  --num_inference_steps=$NUM_INFERENCE_STEPS \
+  --validation_steps=$VAL_STEP \
+  --checkpointing_steps=$VAL_STEP \
+  --output_dir=$OUTPUT_DIR \
+  --checkpoints_total_limit=2 \
+  --resume_from_checkpoint="latest"
