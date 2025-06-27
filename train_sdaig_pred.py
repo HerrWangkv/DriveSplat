@@ -132,7 +132,7 @@ def run_example_validation(pipeline, batch, args, step, generator):
                 output_type="np",
                 timesteps=[args.timestep],
             ).images
-        disparity_out, rgb_out = np.split(preds, 2, axis=0)  # [6, H, W, 3]
+        rgb_out, disparity_out = np.split(preds, 2, axis=0)  # [6, H, W, 3]
         disparity_out = disparity_out.mean(axis=-1)  # [B, H, W]
 
         depth_out = disparity2depth(disparity_out)
@@ -277,7 +277,7 @@ def parse_args():
     parser.add_argument(
         "--timestep",
         type=int,
-        default=1,
+        default=999,
         help="Fixed timestep for single-step training. Set to None for multi-step training.",
     )
     parser.add_argument(
@@ -998,11 +998,15 @@ def main():
                 encoder_hidden_states = encoder_hidden_states.repeat(bsz, 1, 1)
 
                 # Get the task embedding
+                task_emb_rgb = (
+                    torch.tensor([0, 1]).float().unsqueeze(0).to(accelerator.device)
+                )
+                task_emb_rgb = torch.cat(
+                    [torch.sin(task_emb_rgb), torch.cos(task_emb_rgb)], dim=-1
+                ).repeat(bsz_per_task, 1)
                 task_emb_disparity = torch.tensor([1, 0]).float().unsqueeze(0).to(accelerator.device)
                 task_emb_disparity = torch.cat([torch.sin(task_emb_disparity), torch.cos(task_emb_disparity)], dim=-1).repeat(bsz_per_task, 1)
-                task_emb_rgb = torch.tensor([0, 1]).float().unsqueeze(0).to(accelerator.device)
-                task_emb_rgb = torch.cat([torch.sin(task_emb_rgb), torch.cos(task_emb_rgb)], dim=-1).repeat(bsz_per_task, 1)
-                task_emb = torch.cat((task_emb_disparity, task_emb_rgb), dim=0)
+                task_emb = torch.cat((task_emb_rgb, task_emb_disparity), dim=0)
 
                 # Predict
                 down_block_res_samples, mid_block_res_sample = controlnet(
@@ -1028,14 +1032,14 @@ def main():
                     class_labels=task_emb,
                 )[0]
                 # Compute loss
-                disparity_loss = F.mse_loss(
+                rgb_loss = F.mse_loss(
                     model_pred[:bsz_per_task][valid_mask].float(),
-                    disparity_latents[:bsz_per_task][valid_mask].float(),
+                    rgb_latents[:bsz_per_task][valid_mask].float(),
                     reduction="mean",
                 )
-                rgb_loss = F.mse_loss(
+                disparity_loss = F.mse_loss(
                     model_pred[bsz_per_task:][valid_mask].float(),
-                    rgb_latents[:bsz_per_task][valid_mask].float(),
+                    disparity_latents[:bsz_per_task][valid_mask].float(),
                     reduction="mean",
                 )
                 loss = disparity_loss + rgb_loss

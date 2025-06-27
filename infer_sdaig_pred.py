@@ -56,8 +56,21 @@ def parse_args():
         default=999,
     )
     parser.add_argument(
-        "--disparity",
+        "--max_timesteps",
+        type=int,
+        default=1000,
+        help="Maximum timesteps for multi-step diffusion training.",
+    )
+    parser.add_argument(
+        "--multi_step",
         action="store_true",
+        help="Enable multi-step diffusion.",
+    )
+    parser.add_argument(
+        "--num_inference_steps",
+        type=int,
+        default=20,
+        help="Number of inference steps to use during validation when multi-step training is enabled.",
     )
     parser.add_argument(
         "--enable_xformers_memory_efficient_attention", action="store_true", help="Whether or not to use xformers."
@@ -222,27 +235,53 @@ def main():
     with torch.no_grad():
         for frame, data in enumerate(tqdm(dataloader)):
             data = {k: v.to(device) for k, v in data.items()}
+            pixel_values_rendered = render_novel_view(
+                (data[("pixel_values", 0)].squeeze() + 1) / 2,
+                set_inf_to_max(
+                    disparity2depth((data[("disparity_maps", 0)].squeeze() + 1) / 2)
+                ),
+                data["ego_masks"].squeeze(),
+                data["intrinsics"].squeeze(),
+                data["extrinsics", 0].squeeze(),
+                data["intrinsics"].squeeze(),
+                data["extrinsics", 1].squeeze(),
+                (dataset_cfg.height, dataset_cfg.width),
+                render_depth=False,
+            )
+
+            pixel_values_rendered = pixel_values_rendered.permute([0,3,1,2])  # [6, H, W, 3] -> [6, 3, H, W]
+            concat_6_views(pixel_values_rendered).save(
+                os.path.join(args.output_dir, f"{frame+1:04d}_rgb_cond.png")
+            )
             if torch.backends.mps.is_available():
                 autocast_ctx = nullcontext()
             else:
                 autocast_ctx = torch.autocast(pipeline.device.type)
             with autocast_ctx:
-                # Run
-                preds = pipeline(
-                    disparity_cond=data["box_disparity_maps", 0][0],
-                    rgb_cond=data["pixel_values", 0][0],
-                    prompt=["" for _ in range(data["pixel_values", 0].shape[1])],
-                    num_inference_steps=1,
-                    generator=generator,
-                    # guidance_scale=0,
-                    output_type="np",
-                    timesteps=[args.timestep],
-                    processing_res=processing_res,
-                    match_input_res=match_input_res,
-                    resample_method=resample_method,
-                ).images
+                # Run inference with appropriate parameters based on training mode
+                if args.multi_step:
+                    # Multi-step inference with proper denoising steps
+                    preds = pipeline(
+                        disparity_cond=data["box_disparity_maps", 1][0],
+                        rgb_cond=pixel_values_rendered * 2 - 1,
+                        prompt=["" for _ in range(data["pixel_values", 1].shape[1])],
+                        num_inference_steps=args.num_inference_steps,
+                        generator=generator,
+                        output_type="np",
+                    ).images
+                else:
+                    # Single-step inference
+                    preds = pipeline(
+                        disparity_cond=data["box_disparity_maps", 1][0],
+                        rgb_cond=pixel_values_rendered,
+                        prompt=["" for _ in range(data["pixel_values", 1].shape[1])],
+                        num_inference_steps=1,
+                        generator=generator,
+                        output_type="np",
+                        timesteps=[args.timestep],
+                    ).images
 
-                disparity_out, rgb_out = np.split(
+                rgb_out, disparity_out = np.split(
                     preds, 2, axis=0
                 )  # [6, H, W, 3] #TODO inverse
                 disparity_out = disparity_out.mean(axis=-1)  # [B, H, W]
@@ -254,39 +293,21 @@ def main():
                 depth_out = disparity2depth(disparity_out)
                 concat_and_visualize_6_depths(
                     depth_out,
-                    save_path=os.path.join(output_dir, f"{frame:04d}_depth_out.png"),
+                    save_path=os.path.join(output_dir, f"{frame+1:04d}_depth_out.png"),
                 )
-                disparity_gt = (data["disparity_maps", 0][0].cpu().numpy() + 1) / 2
+                disparity_gt = (data["disparity_maps", 1][0].cpu().numpy() + 1) / 2
                 depth_gt = disparity2depth(disparity_gt)
                 depth_gt = set_inf_to_max(depth_gt)
                 concat_and_visualize_6_depths(
                     depth_gt,
-                    save_path=os.path.join(output_dir, f"{frame:04d}_depth_gt.png"),
+                    save_path=os.path.join(output_dir, f"{frame+1:04d}_depth_gt.png"),
                 )
                 concat_6_views(
-                    (data["pixel_values", 0][0] + 1) / 2,  # Normalize to [0, 1]
-                ).save(os.path.join(output_dir, f"{frame:04d}_rgb_gt.png"))
+                    (data["pixel_values", 1][0] + 1) / 2,  # Normalize to [0, 1]
+                ).save(os.path.join(output_dir, f"{frame+1:04d}_rgb_gt.png"))
                 concat_6_views(
                     rgb_out,
-                ).save(os.path.join(output_dir, f"{frame:04d}_rgb_out.png"))
-            novel_images, novel_depth = render_novel_view(
-                rgb_out,
-                depth_out,
-                data["ego_masks"][0].squeeze(),
-                data["intrinsics"][0],
-                data["extrinsics", 0][0],
-                data["intrinsics"][0],
-                data["extrinsics", 1][0],
-                (dataset_cfg.height, dataset_cfg.width),
-            )
-            novel_depth[novel_depth > 200] = 200  # Thresholding to remove noise
-            concat_6_views(
-                novel_images.squeeze().permute([0, 3, 1, 2]),
-            ).save(os.path.join(output_dir, f"{frame+1:04d}_rgb_pred.png"))
-            concat_and_visualize_6_depths(
-                novel_depth,
-                save_path=os.path.join(output_dir, f"{frame+1:04d}_depth_pred.png"),
-            )
+                ).save(os.path.join(output_dir, f"{frame+1:04d}_rgb_out.png"))
             breakpoint()
             torch.cuda.empty_cache()
 

@@ -1609,12 +1609,6 @@ class SDaIGControlNetPipeline(DirectDiffusionControlNetPipeline):
         is_torch_higher_equal_2_1 = is_torch_version(">=", "2.1")
 
         # Generating depth and reconstruction simultaneously
-        depth_task_emb = (
-            torch.tensor([1, 0]).float().unsqueeze(0).repeat(batch_size, 1).to(device)
-        )
-        depth_task_emb = torch.cat(
-            [torch.sin(depth_task_emb), torch.cos(depth_task_emb)], dim=-1
-        )
         recontruction_task_emb = (
             torch.tensor([0, 1]).float().unsqueeze(0).repeat(batch_size, 1).to(device)
         )
@@ -1624,6 +1618,12 @@ class SDaIGControlNetPipeline(DirectDiffusionControlNetPipeline):
                 torch.cos(recontruction_task_emb),
             ],
             dim=-1,
+        )
+        depth_task_emb = (
+            torch.tensor([1, 0]).float().unsqueeze(0).repeat(batch_size, 1).to(device)
+        )
+        depth_task_emb = torch.cat(
+            [torch.sin(depth_task_emb), torch.cos(depth_task_emb)], dim=-1
         )
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
@@ -1661,7 +1661,7 @@ class SDaIGControlNetPipeline(DirectDiffusionControlNetPipeline):
                     ),
                     conditioning_scale=cond_scale,
                     class_labels=torch.cat(
-                        [depth_task_emb, recontruction_task_emb], dim=0
+                        [recontruction_task_emb, depth_task_emb], dim=0
                     ),
                     return_dict=False,
                 )
@@ -1677,7 +1677,7 @@ class SDaIGControlNetPipeline(DirectDiffusionControlNetPipeline):
                     mid_block_additional_residual=mid_block_res_sample,
                     return_dict=False,
                     class_labels=torch.cat(
-                        [depth_task_emb, recontruction_task_emb], dim=0
+                        [recontruction_task_emb, depth_task_emb], dim=0
                     ),
                 )[0]
 
