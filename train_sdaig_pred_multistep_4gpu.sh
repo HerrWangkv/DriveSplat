@@ -1,13 +1,24 @@
 #!/bin/bash
 
-export MODEL_NAME="stabilityai/stable-diffusion-2-base"
+mkdir -p /data/raw
+mkdir -p /data/cache
+fusermount -u /data/raw || true
+fusermount -u /data/cache || true
+squashfuse /data/nuscenes.sqfs /data/raw/
+squashfuse /data/cache.sqfs /data/cache
+
+# Force CUDA operations and add debugging
+export CUDA_LAUNCH_BLOCKING=1
+export PYTORCH3D_NO_OPENGL=1
+
+export MODEL_NAME="jingheya/lotus-depth-g-v2-1-disparity"
 
 # training dataset
 export DATASET_CONFIG_PATH="data/NuScenes/sdaig.yaml"
 
-# training configs
+# training configs for 4 GPUs
 export BATCH_SIZE=1
-export CUDA=01234567
+export CUDA=0123
 export GAS=1
 export TOTAL_BSZ=$(($BATCH_SIZE * ${#CUDA} * $GAS))
 
@@ -17,11 +28,10 @@ export VAL_STEP=500
 export NUM_INFERENCE_STEPS=20  # Number of denoising steps during validation
 
 # output dir
-export OUTPUT_DIR="output/train-sdaig-multistep-bsz${TOTAL_BSZ}/"
+export OUTPUT_DIR="output/train-sdaig-pred-multistep-4gpu-bsz${TOTAL_BSZ}/"
 
 accelerate launch --config_file=accelerate_configs/$CUDA.yaml --mixed_precision="fp16" \
-  --main_process_port="13224" \
-  train_sdaig.py \
+  train_sdaig_pred.py \
   --pretrained_model_name_or_path=$MODEL_NAME \
   --dataset_config_path=$DATASET_CONFIG_PATH \
   --dataloader_num_workers=0 \
@@ -39,5 +49,5 @@ accelerate launch --config_file=accelerate_configs/$CUDA.yaml --mixed_precision=
   --validation_steps=$VAL_STEP \
   --checkpointing_steps=$VAL_STEP \
   --output_dir=$OUTPUT_DIR \
-  --checkpoints_total_limit=5 \
-  --report_to="wandb"
+  --checkpoints_total_limit=2 \
+  --resume_from_checkpoint="latest"
