@@ -79,16 +79,18 @@ def run_example_validation(pipeline, batch, args, step, generator):
 
     dataset_cfg = OmegaConf.load(args.dataset_config_path)
     pixel_values_rendered = render_novel_view(
-        batch[("pixel_values", 0)].squeeze(),
-        set_inf_to_max(disparity2depth(batch[("disparity_maps", 0)].squeeze())),
+        (batch[("pixel_values", 0)].squeeze() + 1) / 2,
+        set_inf_to_max(
+            disparity2depth((batch[("disparity_maps", 0)].squeeze() + 1) / 2)
+        ),
         batch["ego_masks"].squeeze(),
         batch["intrinsics"].squeeze(),
         batch["extrinsics", 0].squeeze(),
         batch["intrinsics"].squeeze(),
         batch["extrinsics", 1].squeeze(),
         (dataset_cfg.height, dataset_cfg.width),
-        render_depth=False)
-
+        render_depth=False,
+    )
     pixel_values_rendered = pixel_values_rendered.permute([0,3,1,2])  # [6, H, W, 3] -> [6, 3, H, W]
     concat_6_views(pixel_values_rendered).save(
         os.path.join(args.output_dir, f"{step}_rgb_cond.png")
@@ -113,7 +115,7 @@ def run_example_validation(pipeline, batch, args, step, generator):
             # Multi-step inference with proper denoising steps
             preds = pipeline(
                 disparity_cond=batch["box_disparity_maps", 1][0],
-                rgb_cond=pixel_values_rendered,
+                rgb_cond=pixel_values_rendered * 2 - 1,
                 prompt=["" for _ in range(batch["pixel_values", 1].shape[1])],
                 num_inference_steps=args.num_inference_steps,
                 generator=generator,
@@ -878,8 +880,12 @@ def main():
                     raise NotImplemented
                 with torch.no_grad():
                     pixel_values_rendered = render_novel_view(
-                        batch[("pixel_values", 0)].squeeze(),
-                        set_inf_to_max(disparity2depth(batch[("disparity_maps", 0)].squeeze())),
+                        (batch[("pixel_values", 0)].squeeze() + 1) / 2,
+                        set_inf_to_max(
+                            disparity2depth(
+                                (batch[("disparity_maps", 0)].squeeze() + 1) / 2
+                            )
+                        ),
                         batch["ego_masks"].squeeze(),
                         batch["intrinsics"].squeeze(),
                         batch["extrinsics", 0].squeeze(),
@@ -970,7 +976,7 @@ def main():
 
                 # Concatenate rgb and depth
                 controlnet_cond = torch.cat(
-                    [pixel_values_rendered, box_disparity_maps], dim=1
+                    [pixel_values_rendered * 2 - 1, box_disparity_maps], dim=1
                 )  # [6*batch_size, 4, H, W]
                 controlnet_cond = torch.cat([controlnet_cond, controlnet_cond], dim=0)
                 controlnet_cond = controlnet_cond.to(weight_dtype)

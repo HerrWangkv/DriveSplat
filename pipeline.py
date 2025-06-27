@@ -1570,7 +1570,9 @@ class SDaIGControlNetPipeline(DirectDiffusionControlNetPipeline):
         ), f"Condition images must have the same spatial dimensions, got {disparity_cond.shape[2:]} and {rgb_cond.shape[2:]}"
         controlnet_cond = torch.cat([rgb_cond, disparity_cond], dim=1)
         # 5. Prepare timesteps
-        timesteps = torch.tensor(timesteps, device=device).long()
+        timesteps, num_inference_steps = retrieve_timesteps(
+            self.scheduler, num_inference_steps, device, timesteps
+        )
         self._num_timesteps = len(timesteps)
 
         # 6. Prepare latent variables
@@ -1605,6 +1607,24 @@ class SDaIGControlNetPipeline(DirectDiffusionControlNetPipeline):
         is_unet_compiled = is_compiled_module(self.unet)
         is_controlnet_compiled = is_compiled_module(self.controlnet)
         is_torch_higher_equal_2_1 = is_torch_version(">=", "2.1")
+
+        # Generating depth and reconstruction simultaneously
+        depth_task_emb = (
+            torch.tensor([1, 0]).float().unsqueeze(0).repeat(batch_size, 1).to(device)
+        )
+        depth_task_emb = torch.cat(
+            [torch.sin(depth_task_emb), torch.cos(depth_task_emb)], dim=-1
+        )
+        recontruction_task_emb = (
+            torch.tensor([0, 1]).float().unsqueeze(0).repeat(batch_size, 1).to(device)
+        )
+        recontruction_task_emb = torch.cat(
+            [
+                torch.sin(recontruction_task_emb),
+                torch.cos(recontruction_task_emb),
+            ],
+            dim=-1,
+        )
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 # Relevant thread:
@@ -1630,31 +1650,6 @@ class SDaIGControlNetPipeline(DirectDiffusionControlNetPipeline):
                         controlnet_cond_scale = controlnet_cond_scale[0]
                     cond_scale = controlnet_cond_scale * controlnet_keep[i]
 
-                # Generating depth and reconstruction simultaneously
-                depth_task_emb = (
-                    torch.tensor([1, 0])
-                    .float()
-                    .unsqueeze(0)
-                    .repeat(len(latent_model_input), 1)
-                    .to(device)
-                )
-                depth_task_emb = torch.cat(
-                    [torch.sin(depth_task_emb), torch.cos(depth_task_emb)], dim=-1
-                )
-                recontruction_task_emb = (
-                    torch.tensor([0, 1])
-                    .float()
-                    .unsqueeze(0)
-                    .repeat(len(latent_model_input), 1)
-                    .to(device)
-                )
-                recontruction_task_emb = torch.cat(
-                    [
-                        torch.sin(recontruction_task_emb),
-                        torch.cos(recontruction_task_emb),
-                    ],
-                    dim=-1,
-                )
                 down_block_res_samples, mid_block_res_sample = self.controlnet(
                     torch.cat([control_model_input, control_model_input], dim=0),
                     t,
@@ -1687,6 +1682,9 @@ class SDaIGControlNetPipeline(DirectDiffusionControlNetPipeline):
                 )[0]
 
                 if len(timesteps) > 1:
+                    x0_pred = torch.cat(
+                        [x0_pred[:batch_size], x0_pred[batch_size:]], dim=1
+                    )
                     # compute the previous noisy sample x_t -> x_t-1
                     latents = self.scheduler.step(
                         x0_pred, t, latents, **extra_step_kwargs, return_dict=False
@@ -1699,7 +1697,8 @@ class SDaIGControlNetPipeline(DirectDiffusionControlNetPipeline):
                     (i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0
                 ):
                     progress_bar.update()
-
+        if len(timesteps) > 1:
+            latents = torch.cat([latents[:, :4], latents[:, 4:]], dim=0)
         if not output_type == "latent":
             image = self.vae.decode(
                 latents / self.vae.config.scaling_factor,

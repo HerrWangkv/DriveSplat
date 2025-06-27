@@ -1,7 +1,7 @@
 name: NuScenes
 nuscenes_version: v1.0-mini
-dataroot: /storage_local/kwang/nuscenes/raw/
-cache: /storage_local/kwang/nuscenes/cache/
+dataroot: /data/raw/
+cache: /data/cache/
 scene_idx: 0
 height: 432
 width: 768
@@ -37,7 +37,7 @@ data:
     height: ${...height}
     width: ${...width}
   val:
-    type: SDaIGNuScenesTestDataset
+    type: SDaIGNuScenesTrainDataset
     version: v1.0-trainval
     dataroot: ${...dataroot}
     cache_dir: ${...cache}
@@ -47,7 +47,7 @@ data:
     height: ${...height}
     width: ${...width}
   inference:
-    type: SDaIGNuScenesTestDataset
+    type: SDaIGNuScenesTrainDataset
     version: v1.0-trainval
     dataroot: ${...dataroot}
     cache_dir: ${...cache}

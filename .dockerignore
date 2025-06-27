@@ -2,3 +2,4 @@ vis/*
 wandb/*
 output/*
 __pycache__
+*.sif

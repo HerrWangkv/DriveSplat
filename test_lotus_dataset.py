@@ -9,7 +9,7 @@ import hydra
 def main(cfg):
     from data import build_dataset_from_cfg
 
-    dataset = build_dataset_from_cfg(cfg.data.train)
+    dataset = build_dataset_from_cfg(cfg.data.inference)
     dataset.vis(0)
     breakpoint()
 
