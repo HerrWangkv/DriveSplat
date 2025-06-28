@@ -32,25 +32,27 @@ export NUM_INFERENCE_STEPS=20  # Number of denoising steps during validation
 # output dir
 export OUTPUT_DIR="output/train-sdaig-pred-multistep-bsz${TOTAL_BSZ}/"
 
-# Set machine rank based on hostname
+# Set machine rank based on hostname and head node
 current_hostname=$(hostname -s)
 echo "Current hostname: $current_hostname"
 echo "SLURM_JOB_NODELIST: $SLURM_JOB_NODELIST"
+echo "Master address: $MASTER_ADDR"
 
-# Simple hostname-based ranking for known nodes
-if [[ "$current_hostname" == "hkn0401" ]]; then
+# The head node (master) should always have rank 0
+# Get head node IP and determine which node is the head node
+head_node_ip="$MASTER_ADDR"
+
+# Check if current node is the head node by comparing IPs
+current_ip=$(hostname -I | awk '{print $1}')
+echo "Current IP: $current_ip"
+echo "Head node IP: $head_node_ip"
+
+if [[ "$current_ip" == "$head_node_ip" ]]; then
     export MACHINE_RANK=0
-elif [[ "$current_hostname" == "hkn0402" ]]; then
-    export MACHINE_RANK=1
+    echo "This node is the HEAD NODE (master)"
 else
-    # Fallback: extract node number and use modulo
-    if [[ "$current_hostname" =~ hkn([0-9]+) ]]; then
-        node_num=${BASH_REMATCH[1]}
-        # For 2-node setup, use modulo 2
-        export MACHINE_RANK=$((node_num % 2))
-    else
-        export MACHINE_RANK=0
-    fi
+    export MACHINE_RANK=1
+    echo "This node is a WORKER NODE"
 fi
 
 echo "Current hostname: $(hostname -s)"
@@ -63,15 +65,12 @@ echo "SLURM_LOCALID: $SLURM_LOCALID"
 echo "SLURM_NODEID: $SLURM_NODEID"
 echo "SLURM_NODEID: $SLURM_NODEID"
 
-# Test network connectivity
-if [ "$MACHINE_RANK" != "0" ]; then
-    echo "Testing connectivity to master node..."
-    nc -z $MASTER_ADDR $MASTER_PORT
-    echo "Network test exit code: $?"
-fi
+# Network connectivity test removed (nc command not available in container)
+# The actual distributed training uses PyTorch's NCCL backend for communication
 
 # Use accelerate launch with simplified multi-node configuration
-timeout 1800 accelerate launch \
+# Removed timeout to let training run for full duration
+accelerate launch \
   --multi_gpu \
   --mixed_precision="fp16" \
   --num_machines=2 \

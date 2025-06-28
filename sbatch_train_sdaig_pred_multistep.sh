@@ -2,10 +2,10 @@
 #SBATCH --job-name=drivesplat_train
 #SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=128
+#SBATCH --cpus-per-task=32  # 8 CPUs per GPU (4 GPUs per node), optimized from 128 for better efficiency
 #SBATCH --gres=gpu:4
-#SBATCH --time=00:30:00
-#SBATCH --partition=dev_accelerated
+#SBATCH --time=48:00:00
+#SBATCH --partition=accelerated
 #SBATCH --output=logs/train_job_%j.out
 #SBATCH --error=logs/train_job_%j.err
 
@@ -75,7 +75,7 @@ mount_squashfuse() {
 
     # Keep the mount process alive
     while true; do
-        sleep 90000  # 25 hours
+        sleep 172800  # 48 hours
     done
 }
 export -f mount_squashfuse
@@ -113,6 +113,27 @@ echo "Head node IP: $head_node_ip"
 # Set master node and port for distributed training
 export MASTER_ADDR=$head_node_ip
 export MASTER_PORT=29500
+
+# Test connectivity between all nodes with improved logic
+echo "Testing inter-node connectivity..."
+# Get all node IPs first
+all_ips=$(srun --ntasks=$SLURM_JOB_NUM_NODES --ntasks-per-node=1 hostname -I | awk '{print $1}' | sort | uniq | tr '\n' ' ')
+echo "All node IPs: $all_ips"
+
+# Test connectivity from each node to every other node
+srun --ntasks=$SLURM_JOB_NUM_NODES --ntasks-per-node=1 bash -c "
+    my_ip=\$(hostname -I | awk '{print \$1}')
+    echo \"Testing from node \$(hostname) (\$my_ip):\"
+    for target_ip in $all_ips; do
+        if [ \"\$target_ip\" != \"\$my_ip\" ]; then
+            if timeout 5 ping -c 2 -W 2 \$target_ip > /dev/null 2>&1; then
+                echo \"  -> \$target_ip: OK\"
+            else
+                echo \"  -> \$target_ip: FAILED\"
+            fi
+        fi
+    done
+"
 
 # Mount the SquashFS files (in background, with resource overlap)
 srun --overlap bash -c mount_squashfuse &
