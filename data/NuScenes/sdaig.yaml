@@ -37,7 +37,7 @@ data:
     height: ${...height}
     width: ${...width}
   val:
-    type: SDaIGNuScenesTrainDataset
+    type: SDaIGNuScenesTestDataset
     version: v1.0-trainval
     dataroot: ${...dataroot}
     cache_dir: ${...cache}
@@ -47,11 +47,11 @@ data:
     height: ${...height}
     width: ${...width}
   inference:
-    type: SDaIGNuScenesTrainDataset
+    type: SDaIGNuScenesTestDataset
     version: v1.0-trainval
     dataroot: ${...dataroot}
     cache_dir: ${...cache}
-    split: 219
+    split: 83
     view_order: ${...cameras}
     N: ${...interpolated_frame_between_keyframes}
     height: ${...height}

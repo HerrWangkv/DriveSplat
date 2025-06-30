@@ -142,6 +142,171 @@ def depth_to_pointcloud(depth: torch.Tensor,
     return points, colors
 
 
+def assign_points_to_objects(
+    points: torch.Tensor,
+    objects_to_world: torch.Tensor,
+    box_sizes: torch.Tensor,
+    expanding_factor: float = 1.0,
+) -> torch.Tensor:
+    """
+    Assign points to objects based on their 3D positions, assuming objects are vertical.
+    Uses 2D bounding box check in X-Y plane with Z bounds for autonomous driving scenarios.
+
+    Args:
+        points: 3D points tensor of shape (N, 3)
+        objects_to_world: Object transformation matrices of shape (M, 4, 4)
+        box_sizes: Sizes of the boxes for each object of shape (M, 3) in [length, width, height]
+        expanding_factor: Factor to expand the bounding boxes (default: 1.0, no expansion)
+
+    Returns:
+        assignments: Tensor of shape (N,) with object indices. -1 indicates background points.
+    """
+    device = points.device
+    N = points.shape[0]
+    M = objects_to_world.shape[0]
+
+    assignments = torch.full((N,), -1, dtype=torch.long, device=device)
+
+    if M == 0:
+        return assignments
+
+    for obj_idx in range(M):
+        # Get object center in world coordinates (translation part of transformation matrix)
+        obj_center_world = objects_to_world[obj_idx][:3, 3]  # Shape: (3,)
+
+        # For vertical objects, we primarily care about X-Y plane membership
+        # Calculate X-Y bounds in world coordinates with expanding factor
+        box_half_length = (
+            box_sizes[obj_idx][0] / 2.0
+        ) * expanding_factor  # length/2 * factor
+        box_half_width = (
+            box_sizes[obj_idx][1] / 2.0
+        ) * expanding_factor  # width/2 * factor
+        box_height = box_sizes[obj_idx][2] * expanding_factor  # full height * factor
+
+        # First, do a rough distance filter to avoid rotating all points
+        # Use a conservative bounding circle in X-Y plane
+        max_radius = (
+            torch.sqrt(box_half_length**2 + box_half_width**2) * 1.1
+        )  # 10% margin
+
+        # Quick distance check in X-Y plane
+        xy_distances = torch.norm(
+            points[:, :2] - obj_center_world[:2].unsqueeze(0), dim=1
+        )
+        rough_candidates = xy_distances <= max_radius
+
+        # Quick Z bounds check
+        z_center = obj_center_world[2]
+        z_min = z_center - box_height / 2.0
+        z_max = z_center + box_height / 2.0
+        z_candidates = (points[:, 2] >= z_min) & (points[:, 2] <= z_max)
+
+        # Combine rough filters
+        candidate_mask = rough_candidates & z_candidates
+
+        if not candidate_mask.any():
+            continue  # No points are even close to this object
+
+        # Only process candidate points for precise checking
+        candidate_points = points[candidate_mask]
+
+        # Extract object rotation matrix for X-Y plane transformation
+        obj_rotation_xy = objects_to_world[obj_idx][:2, :2]  # 2x2 rotation in X-Y plane
+
+        # Transform candidate points to object-centered coordinate system (X-Y plane only)
+        points_centered = candidate_points[:, :2] - obj_center_world[:2].unsqueeze(
+            0
+        )  # (N_candidates, 2)
+
+        # Rotate to object-aligned coordinates in X-Y plane (only for candidates)
+        obj_rotation_xy_inv = torch.inverse(obj_rotation_xy)
+        points_obj_xy = torch.matmul(
+            points_centered, obj_rotation_xy_inv.T
+        )  # (N_candidates, 2)
+
+        # Check X-Y plane membership (primary condition for vertical objects)
+        xy_inside_mask = (
+            torch.abs(points_obj_xy[:, 0]) <= box_half_length
+        ) & (  # length check
+            torch.abs(points_obj_xy[:, 1]) <= box_half_width
+        )  # width check
+
+        # Final Z bounds check for candidates (redundant but precise)
+        z_inside_mask = (candidate_points[:, 2] >= z_min) & (
+            candidate_points[:, 2] <= z_max
+        )
+
+        # Combine X-Y and Z conditions for candidates
+        inside_mask_candidates = xy_inside_mask & z_inside_mask
+
+        # Map back to original point indices and assign
+        if inside_mask_candidates.any():
+            candidate_indices = torch.where(candidate_mask)[0]
+            final_indices = candidate_indices[inside_mask_candidates]
+            assignments[final_indices] = obj_idx
+
+    return assignments
+
+
+def move_objects_in_pointcloud(
+    points: torch.Tensor,
+    objects_to_world: torch.Tensor,
+    box_sizes: torch.Tensor,
+    transforms_cur_to_next: torch.Tensor,
+    expanding_factor: float = 1.0,
+) -> torch.Tensor:
+    """
+    Move objects in point cloud based on their transformations.
+
+    Args:
+        points: 3D points tensor of shape (N, 3)
+        objects_to_world: Object transformation matrices of shape (M, 4, 4)
+        box_sizes: Sizes of the boxes for each object of shape (M, 3)
+        transforms_cur_to_next: Combined transformations (rotation + translation + scaling)
+                               from current to next frame of shape (M, 4, 4)
+        expanding_factor: Factor to expand the bounding boxes for point assignment (default: 1.0)
+    Returns:
+        moved_points: Points after applying transformations, shape (N, 3)
+    """
+    device = points.device
+    moved_points = points.clone()
+
+    if objects_to_world.shape[0] == 0:
+        # No objects to transform
+        return moved_points
+
+    # Convert points to homogeneous coordinates
+    homogeneous_points = torch.cat(
+        [points, torch.ones(points.shape[0], 1, device=device)], dim=-1
+    )
+
+    # Automatically assign points to objects
+    point_object_assignments = assign_points_to_objects(
+        points=points,
+        objects_to_world=objects_to_world,
+        box_sizes=box_sizes,
+        expanding_factor=expanding_factor,
+    )
+
+    # Transform points based on their object assignments
+    for obj_idx in range(objects_to_world.shape[0]):
+        # Find points belonging to this object
+        point_mask = point_object_assignments == obj_idx
+        if not point_mask.any():
+            continue
+
+        # Get points for this object
+        obj_points = homogeneous_points[point_mask]
+
+        transformed_points = torch.matmul(obj_points, transforms_cur_to_next[obj_idx].T)
+
+        # Update the moved points for this object
+        moved_points[point_mask] = transformed_points[:, :3]
+
+    return moved_points
+
+
 def paste_ego_area(
     current: torch.Tensor,
     current_ego_mask: torch.Tensor,
@@ -165,6 +330,10 @@ def render_novel_view(
     current_extrinsics: torch.Tensor,
     novel_intrinsics: torch.Tensor,
     novel_extrinsics: torch.Tensor,
+    current_objs_to_world: Optional[torch.Tensor] = None,
+    current_box_sizes: Optional[torch.Tensor] = None,
+    transforms_cur_to_next: Optional[torch.Tensor] = None,
+    expanding_factor: float = 1.0,
     image_size: Tuple[int, int] = (512, 512),
     point_radius: float = 0.01,
     points_per_pixel: int = 8,
@@ -172,7 +341,7 @@ def render_novel_view(
     render_depth: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Render novel view using PyTorch3D point cloud rendering.
+    Render novel view using PyTorch3D point cloud rendering with optional object movement.
 
     Args:
         current_images: Current view RGB images, shape (B, C, H, W), (C, H, W), (B, H, W, C), or (H, W, C)
@@ -184,10 +353,15 @@ def render_novel_view(
         current_extrinsics: Current camera extrinsics, shape (B, 4, 4) or (4, 4)
         novel_intrinsics: Novel view intrinsics, shape (B, 3, 3) or (3, 3)
         novel_extrinsics: Novel view extrinsics, shape (B, 4, 4) or (4, 4)
+        current_objs_to_world: Optional object-to-world matrices, shape (M, 4, 4)
+        current_box_sizes: Optional object box sizes, shape (M, 3)
+        transforms_cur_to_next: Optional transformations from current to next frame, shape (M, 4, 4)
+        expanding_factor: Factor to expand bounding boxes for point assignment (default: 1.0)
         image_size: Output image size (height, width)
         point_radius: Radius of rendered points
         points_per_pixel: Number of points to consider per pixel
         background_color: Background color (R, G, B) in range [0, 1]
+        render_depth: Whether to render depth maps
 
     Returns:
         novel_images: Novel view RGB images, shape (B, H, W, 3)
@@ -235,6 +409,22 @@ def render_novel_view(
     # Convert depth maps to point clouds (concatenated from all cameras)
     points, colors = depth_to_pointcloud(current_depths, current_intrinsics, 
                                        current_extrinsics, current_images, current_ego_mask)
+
+    # Apply object movement if transformation data is provided
+    if (
+        current_objs_to_world is not None
+        and current_box_sizes is not None
+        and transforms_cur_to_next is not None
+    ):
+
+        # Move objects in the point cloud based on transformations
+        points = move_objects_in_pointcloud(
+            points=points,
+            objects_to_world=current_objs_to_world,
+            box_sizes=current_box_sizes,
+            transforms_cur_to_next=transforms_cur_to_next,
+            expanding_factor=expanding_factor,
+        )
 
     # Create single PyTorch3D point cloud from all cameras
     # Filter out zero points
@@ -310,6 +500,7 @@ def render_novel_view(
     # Extract RGB and depth
     novel_images = rendered[..., :3]  # (B, H, W, 3)
     if not render_depth:
+        breakpoint()
         return paste_ego_area(current_images, current_ego_mask, novel_images)
     # Extract depth from rasterizer's z-buffer
     # The rasterizer provides depth information through its fragments
@@ -505,30 +696,30 @@ def visualize_point_cloud(points: torch.Tensor, colors: Optional[torch.Tensor] =
     try:
         import matplotlib.pyplot as plt
         from mpl_toolkits.mplot3d import Axes3D
-        
+
         fig = plt.figure(figsize=(10, 8))
         ax = fig.add_subplot(111, projection='3d')
-        
+
         points_np = points.detach().cpu().numpy()
-        
+
         if colors is not None:
             colors_np = colors.detach().cpu().numpy()
             ax.scatter(points_np[:, 0], points_np[:, 1], points_np[:, 2], 
                       c=colors_np, s=1)
         else:
             ax.scatter(points_np[:, 0], points_np[:, 1], points_np[:, 2], s=1)
-        
+
         ax.set_xlabel('X')
         ax.set_ylabel('Y') 
         ax.set_zlabel('Z')
         ax.set_title('Point Cloud Visualization')
-        
+
         if save_path:
             plt.savefig(save_path, dpi=150, bbox_inches='tight')
         else:
             plt.show()
-            
+
         plt.close()
-        
+
     except ImportError:
         print("Matplotlib not available for visualization")

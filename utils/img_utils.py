@@ -148,6 +148,7 @@ def concat_and_visualize_6_depths(
     fig, axes = plt.subplots(2, 3, figsize=(12, 4))
     vmin = 0  # min([np.min(d) for d in depths])
     vmax = max([np.max(d) for d in depths]) if vmax is None else vmax
+    depths = [np.clip(depth, vmin, vmax) for depth in depths]
 
     ims = []
     for i, ax in enumerate(axes.flat):

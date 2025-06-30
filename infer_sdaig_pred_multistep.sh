@@ -9,7 +9,7 @@ squashfuse /data/cache.sqfs /data/cache
 
 export CUDA=0
 
-export CHECKPOINT_DIR="output/train-sdaig-pred-multistep-bsz8/checkpoint-18000"
+export CHECKPOINT_DIR="output/train-sdaig-pred-multistep-bsz8/checkpoint-2500"
 export OUTPUT_DIR="output/infer-sdaig-pred-multistep"
 export DATASET_CONFIG="data/NuScenes/sdaig.yaml"
 export MAX_TIMESTEPS=1000

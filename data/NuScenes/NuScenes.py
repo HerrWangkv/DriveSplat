@@ -548,8 +548,17 @@ class NuScenesBase(NuScenes):
         objects = []
 
         for instance_id in frame_instances:
-            _, obj_to_world, box_size = self.get_frame_annotation(index, instance_id)
-            objects.append({"obj_to_world": obj_to_world, "box_size": box_size})
+            class_name, obj_to_world, box_size = self.get_frame_annotation(
+                index, instance_id
+            )
+            objects.append(
+                {
+                    "instance_id": instance_id,
+                    "obj_to_world": obj_to_world,
+                    "box_size": box_size,
+                    "class_name": class_name,
+                }
+            )
         return objects
 
     def get_ego_pose(self, index, sensor):
@@ -961,10 +970,108 @@ class SDaIGNuScenesDataset(Dataset):
     def is_last_frame(self, index):
         return self.nusc.is_last_frame(index)
 
+    def __getitem__(self, index):
+        raise NotImplementedError("This method should be implemented in subclasses.")
+
+    def get_common_moving_objects_info(self, index, interval):
+        """
+        Get common objects information for the given index and interval.
+        Returns objects that exist in both current and next frames, along with
+        transformations to move them from current to next frame positions.
+        Also includes box size transformations (scaling factors).
+        """
+        ret = {}
+        cur_objects = self.nusc.get_frame_objects(index)
+
+        if interval == 0:
+            # No moving objects
+            ret["objs_to_world", 0] = torch.empty(0, 4, 4).float()
+            ret["box_sizes", 0] = torch.empty(0, 3).float()
+            ret["box_sizes", 1] = torch.empty(0, 3).float()
+            ret["transforms", 0, 1] = torch.empty(0, 4, 4).float()
+        else:
+            # Get objects in the next frame
+            next_objects = self.nusc.get_frame_objects(index + interval)
+            # Create a mapping of instance_id to object info and index for next frame
+            next_objects_dict = {obj["instance_id"]: obj for obj in next_objects}
+
+            # Find common objects (objects that exist in both frames)
+            objs_to_world_0 = []
+            box_sizes_0 = []
+            box_sizes_1 = []
+            transforms = []
+
+            for cur_obj in cur_objects:
+                if cur_obj["class_name"] in ["barrier", "traffic_cone"]:
+                    continue
+                instance_id = cur_obj["instance_id"]
+                if instance_id in next_objects_dict:
+                    # Object exists in both frames
+                    next_obj = next_objects_dict[instance_id]
+
+                    # Calculate transformation from current to next position
+                    cur_obj_to_world = cur_obj[
+                        "obj_to_world"
+                    ]  # 4x4 transformation matrix
+                    next_obj_to_world = next_obj[
+                        "obj_to_world"
+                    ]  # 4x4 transformation matrix
+
+                    # Get box sizes
+                    cur_box_size = np.array(
+                        cur_obj["box_size"]
+                    )  # [length, width, height]
+                    next_box_size = np.array(
+                        next_obj["box_size"]
+                    )  # [length, width, height]
+
+                    # Calculate scale factors for box size changes
+                    # Avoid division by zero by adding small epsilon
+                    eps = 1e-8
+                    scale_factor = next_box_size / (cur_box_size + eps)
+
+                    # Transform from current object frame to next object frame
+                    # T_cur_to_next = T_next_world * T_world_cur
+                    # where T_world_cur = inv(T_cur_world)
+                    cur_world_to_obj = np.linalg.inv(cur_obj_to_world)
+                    transform_cur_to_next = next_obj_to_world @ cur_world_to_obj
+
+                    # Optionally, incorporate scaling into the transformation matrix
+                    # Create a scaling matrix in object coordinates
+                    scale_matrix = np.eye(4)
+                    scale_matrix[0, 0] = scale_factor[0]  # length
+                    scale_matrix[1, 1] = scale_factor[1]  # width
+                    scale_matrix[2, 2] = scale_factor[2]  # height
+
+                    # Combine geometric transformation with scaling
+                    # First scale, then transform
+                    combined_transform = transform_cur_to_next @ scale_matrix
+
+                    objs_to_world_0.append(cur_obj_to_world)
+                    box_sizes_0.append(cur_obj["box_size"])
+                    box_sizes_1.append(next_obj["box_size"])
+                    transforms.append(torch.tensor(combined_transform).float())
+
+            # Handle empty case
+            if len(transforms) > 0:
+                ret["objs_to_world", 0] = torch.tensor(
+                    np.stack(objs_to_world_0)
+                ).float()
+                ret["box_sizes", 0] = torch.tensor(box_sizes_0).float()
+                ret["box_sizes", 1] = torch.tensor(box_sizes_1).float()
+                ret["transforms", 0, 1] = torch.stack(transforms, dim=0)
+            else:
+                # No common objects found
+                ret["objs_to_world", 0] = torch.empty(0, 4, 4).float()
+                ret["box_sizes", 0] = torch.empty(0, 3).float()
+                ret["box_sizes", 1] = torch.empty(0, 3).float()
+                ret["transforms", 0, 1] = torch.empty(0, 4, 4).float()
+        return ret
+
 
 class SDaIGNuScenesTrainDataset(SDaIGNuScenesDataset):
     def __getitem__(self, index):
-        interval = 1 if not self.is_last_frame(index) else -1
+        interval = 1 if not self.is_last_frame(index) else 0
         ret = {}
         ret["pixel_values", 0] = (
             self.pixel_values[index]["pixel_values"] * 2 - 1
@@ -998,12 +1105,13 @@ class SDaIGNuScenesTrainDataset(SDaIGNuScenesDataset):
         ret["intrinsics"] = torch.stack(intrinsics, dim=0)
         ret["extrinsics", 0] = torch.stack(extrinsics0, dim=0)
         ret["extrinsics", 1] = torch.stack(extrinsics1, dim=0)
+        ret.update(self.get_common_moving_objects_info(index, interval))
         return {k: v.cpu().to(torch.float32) for k, v in ret.items()}
 
 
 class SDaIGNuScenesTestDataset(SDaIGNuScenesDataset):
     def __getitem__(self, index):
-        interval = 1 if not self.is_last_frame(index) else -1
+        interval = 1 if not self.is_last_frame(index) else 0
         ret = {}
         ret["pixel_values", 0] = (
             self.pixel_values[index]["pixel_values"] * 2 - 1
@@ -1013,6 +1121,9 @@ class SDaIGNuScenesTestDataset(SDaIGNuScenesDataset):
         )  # Normalize to [-1, 1]
         ret["box_disparity_maps", 0] = (
             self.box_disparity_maps[index]["box_disparity_maps"] * 2 - 1
+        )  # Normalize to [-1, 1]
+        ret["box_disparity_maps", 1] = (
+            self.box_disparity_maps[index + interval]["box_disparity_maps"] * 2 - 1
         )  # Normalize to [-1, 1]
         ret["disparity_maps", 0] = (
             self.disparity_maps[index]["disparity_maps"] * 2 - 1
@@ -1037,6 +1148,7 @@ class SDaIGNuScenesTestDataset(SDaIGNuScenesDataset):
         ret["intrinsics"] = torch.stack(intrinsics, dim=0)
         ret["extrinsics", 0] = torch.stack(extrinsics0, dim=0)
         ret["extrinsics", 1] = torch.stack(extrinsics1, dim=0)
+        ret.update(self.get_common_moving_objects_info(index, interval))
         return {k: v.cpu().to(torch.float32) for k, v in ret.items()}
 
     def vis(self, index):
@@ -1045,11 +1157,13 @@ class SDaIGNuScenesTestDataset(SDaIGNuScenesDataset):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         item = {k: v.to(device) for k, v in item.items()}
         cond_disparity_maps = (
-            item["box_disparity_maps", 0] + 1
+            item["box_disparity_maps", 1] + 1
         ) / 2  # Normalize to [0, 1]
         cond_depth_maps = disparity2depth(cond_disparity_maps)
         concat_and_visualize_6_depths(
-            set_inf_to_max(cond_depth_maps), save_path="vis/cond_depth_maps.png"
+            set_inf_to_max(cond_depth_maps),
+            save_path="vis/cond_depth_maps.png",
+            vmax=50,
         )
         pixel_values = (item["pixel_values", 0] + 1) / 2  # Normalize to [0, 1]
         ego_masks = item["ego_masks"]
@@ -1057,23 +1171,60 @@ class SDaIGNuScenesTestDataset(SDaIGNuScenesDataset):
         disparity_maps = (item["disparity_maps", 0] + 1) / 2  # Normalize to [0, 1]
         depth_maps = disparity2depth(disparity_maps)
 
-        concat_and_visualize_6_depths(set_inf_to_max(depth_maps), f"vis/depth_maps.png")
+        concat_and_visualize_6_depths(
+            set_inf_to_max(depth_maps),
+            f"vis/depth_maps.png",
+            vmax=50,
+        )
+        start_time = time.time()
         with torch.no_grad():
             novel_images, novel_depth = render_novel_view(
-                pixel_values,
-                set_inf_to_max(depth_maps).squeeze(),
-                ego_masks.squeeze(),
-                item["intrinsics"],
-                item["extrinsics", 0],
-                item["intrinsics"],
-                item["extrinsics", 1],
-                self.img_size,
+                current_images=pixel_values,
+                current_depths=set_inf_to_max(depth_maps).squeeze(),
+                current_ego_mask=ego_masks.squeeze(),
+                current_intrinsics=item["intrinsics"],
+                current_extrinsics=item["extrinsics", 0],
+                novel_intrinsics=item["intrinsics"],
+                novel_extrinsics=item["extrinsics", 1],
+                image_size=self.img_size,
             )
+        print(
+            f"Novel view rendering (wo moving objects) took {time.time() - start_time:.2f} seconds"
+        )
+        concat_6_views(
+            novel_images.squeeze().permute([0, 3, 1, 2]),
+        ).save("vis/predicted_novel_view_wo_moving_objects.png")
+        concat_and_visualize_6_depths(
+            set_inf_to_max(novel_depth),
+            save_path="vis/predicted_novel_view_depth_wo_moving_objects.png",
+            vmax=50,
+        )
+        start_time = time.time()
+        with torch.no_grad():
+            novel_images, novel_depth = render_novel_view(
+                current_images=pixel_values,
+                current_depths=set_inf_to_max(depth_maps).squeeze(),
+                current_ego_mask=ego_masks.squeeze(),
+                current_intrinsics=item["intrinsics"],
+                current_extrinsics=item["extrinsics", 0],
+                novel_intrinsics=item["intrinsics"],
+                novel_extrinsics=item["extrinsics", 1],
+                current_objs_to_world=item["objs_to_world", 0],
+                current_box_sizes=item["box_sizes", 0],
+                transforms_cur_to_next=item["transforms", 0, 1],
+                expanding_factor=1.5,
+                image_size=self.img_size,
+            )
+        print(
+            f"Novel view rendering (w moving objects) took {time.time() - start_time:.2f} seconds"
+        )
         concat_6_views(
             novel_images.squeeze().permute([0, 3, 1, 2]),
         ).save("vis/predicted_novel_view.png")
         concat_and_visualize_6_depths(
-            set_inf_to_max(novel_depth), save_path="vis/predicted_novel_view_depth.png"
+            set_inf_to_max(novel_depth),
+            save_path="vis/predicted_novel_view_depth.png",
+            vmax=50,
         )
 
         next_disparity_maps = (item["disparity_maps", 1] + 1) / 2  # Normalize to [0, 1]
@@ -1081,6 +1232,7 @@ class SDaIGNuScenesTestDataset(SDaIGNuScenesDataset):
         concat_and_visualize_6_depths(
             set_inf_to_max(next_depth_maps),
             save_path="vis/real_novel_view_depth.png",
+            vmax=50,
         )
         next_pixel_values = (item["pixel_values", 1] + 1) / 2  # Normalize to [0, 1]
         concat_6_views(next_pixel_values).save("vis/real_novel_view.png")

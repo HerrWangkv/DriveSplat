@@ -245,6 +245,9 @@ def main():
                 data["extrinsics", 0].squeeze(),
                 data["intrinsics"].squeeze(),
                 data["extrinsics", 1].squeeze(),
+                data["objs_to_world", 0].squeeze(),
+                data["box_sizes", 0].squeeze(),
+                data["transforms", 0, 1].squeeze(),
                 (dataset_cfg.height, dataset_cfg.width),
                 render_depth=False,
             )
