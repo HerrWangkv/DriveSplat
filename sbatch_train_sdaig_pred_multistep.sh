@@ -2,7 +2,7 @@
 #SBATCH --job-name=drivesplat_train
 #SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=32  # 8 CPUs per GPU (4 GPUs per node), optimized from 128 for better efficiency
+#SBATCH --cpus-per-task=8  # 2 CPUs per GPU (4 GPUs per node)
 #SBATCH --gres=gpu:4
 #SBATCH --time=48:00:00
 #SBATCH --partition=accelerated
@@ -73,9 +73,26 @@ mount_squashfuse() {
         echo "Warning: $CACHE_SQFS not found"
     fi
 
-    # Keep the mount process alive
+    # Keep the mount process alive with better error handling
     while true; do
-        sleep 172800  # 48 hours
+        # Check if mounts are still active
+        if ! mountpoint -q "$MOUNT_PATH_RAW" 2>/dev/null; then
+            echo "Warning: Raw mount lost, attempting remount..."
+            if [ -f "$NUSCENES_SQFS" ] && squashfuse_ll "$NUSCENES_SQFS" "$MOUNT_PATH_RAW" 2>/dev/null; then
+                echo "Success: Raw mount remounted at $MOUNT_PATH_RAW"
+            else
+                echo "Error: Failed to remount raw SquashFS"
+            fi
+        fi
+        if ! mountpoint -q "$MOUNT_PATH_CACHE" 2>/dev/null; then
+            echo "Warning: Cache mount lost, attempting remount..."
+            if [ -f "$CACHE_SQFS" ] && squashfuse_ll "$CACHE_SQFS" "$MOUNT_PATH_CACHE" 2>/dev/null; then
+                echo "Success: Cache mount remounted at $MOUNT_PATH_CACHE"
+            else
+                echo "Error: Failed to remount cache SquashFS"
+            fi
+        fi
+        sleep 300  # Check every 5 minutes instead of sleeping for 48 hours
     done
 }
 export -f mount_squashfuse

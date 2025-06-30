@@ -7,6 +7,10 @@ docker build -t drivesplat .
 ```bash
 apptainer build drivesplat.sif docker-daemon://drivesplat:latest
 ```
+or
+```bash
+apptainer pull drivesplat.sif docker://kaiwenwangkit/drivesplat:20250628
+```
 
 ## Running the Container
 ### Apptainer

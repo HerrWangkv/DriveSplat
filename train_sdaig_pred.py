@@ -79,16 +79,20 @@ def run_example_validation(pipeline, batch, args, step, generator):
 
     dataset_cfg = OmegaConf.load(args.dataset_config_path)
     pixel_values_rendered = render_novel_view(
-        (batch[("pixel_values", 0)].squeeze() + 1) / 2,
-        set_inf_to_max(
+        current_images=(batch[("pixel_values", 0)].squeeze() + 1) / 2,
+        current_depths=set_inf_to_max(
             disparity2depth((batch[("disparity_maps", 0)].squeeze() + 1) / 2)
         ),
-        batch["ego_masks"].squeeze(),
-        batch["intrinsics"].squeeze(),
-        batch["extrinsics", 0].squeeze(),
-        batch["intrinsics"].squeeze(),
-        batch["extrinsics", 1].squeeze(),
-        (dataset_cfg.height, dataset_cfg.width),
+        current_ego_mask=batch["ego_masks"].squeeze(),
+        current_intrinsics=batch["intrinsics"].squeeze(),
+        current_extrinsics=batch["extrinsics", 0].squeeze(),
+        novel_intrinsics=batch["intrinsics"].squeeze(),
+        novel_extrinsics=batch["extrinsics", 1].squeeze(),
+        current_objs_to_world=batch["objs_to_world", 0][0],
+        current_box_sizes=batch["box_sizes", 0][0],
+        transforms_cur_to_next=batch["transforms", 0, 1][0],
+        expanding_factor=1.5,
+        image_size=(dataset_cfg.height, dataset_cfg.width),
         render_depth=False,
     )
     pixel_values_rendered = pixel_values_rendered.permute([0,3,1,2])  # [6, H, W, 3] -> [6, 3, H, W]
@@ -160,13 +164,13 @@ def log_validation(
     step,
 ):
     logger.info("Running validation")
-    
+
     # Create scheduler
     scheduler = DDIMScheduler.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="scheduler"
     )
     scheduler.register_to_config(prediction_type=args.prediction_type)
-    
+
     # Create pipeline directly with our trained components
     # Since the base model doesn't have ControlNet, we skip loading from pretrained
     pipeline = SDaIGControlNetPipeline(
@@ -180,10 +184,10 @@ def log_validation(
         feature_extractor=None,
         requires_safety_checker=False,
     )
-    
+
     pipeline = pipeline.to(accelerator.device)
     pipeline.set_progress_bar_config(disable=True)
-    
+
     if args.enable_xformers_memory_efficient_attention:
         if is_xformers_available():
             pipeline.enable_xformers_memory_efficient_attention()
@@ -191,15 +195,19 @@ def log_validation(
             raise ValueError(
                 "xformers is not available. Make sure it is installed correctly"
             )
-    
+
     if args.seed is None:
         generator = None
     else:
         generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
-    
+
     run_example_validation(pipeline, batch, args, step, generator)
     del pipeline
     torch.cuda.empty_cache()
+    # Force garbage collection to free memory
+    import gc
+
+    gc.collect()
 
 
 def parse_args():
@@ -880,18 +888,22 @@ def main():
                     raise NotImplemented
                 with torch.no_grad():
                     pixel_values_rendered = render_novel_view(
-                        (batch[("pixel_values", 0)].squeeze() + 1) / 2,
-                        set_inf_to_max(
+                        current_images=(batch[("pixel_values", 0)].squeeze() + 1) / 2,
+                        current_depths=set_inf_to_max(
                             disparity2depth(
                                 (batch[("disparity_maps", 0)].squeeze() + 1) / 2
                             )
                         ),
-                        batch["ego_masks"].squeeze(),
-                        batch["intrinsics"].squeeze(),
-                        batch["extrinsics", 0].squeeze(),
-                        batch["intrinsics"].squeeze(),
-                        batch["extrinsics", 1].squeeze(),
-                        (dataset_cfg.height, dataset_cfg.width),
+                        current_ego_mask=batch["ego_masks"].squeeze(),
+                        current_intrinsics=batch["intrinsics"].squeeze(),
+                        current_extrinsics=batch["extrinsics", 0].squeeze(),
+                        novel_intrinsics=batch["intrinsics"].squeeze(),
+                        novel_extrinsics=batch["extrinsics", 1].squeeze(),
+                        current_objs_to_world=batch["objs_to_world", 0][0],
+                        current_box_sizes=batch["box_sizes", 0][0],
+                        transforms_cur_to_next=batch["transforms", 0, 1][0],
+                        expanding_factor=1.5,
+                        image_size=(dataset_cfg.height, dataset_cfg.width),
                         render_depth=False,
                     )
                     pixel_values_rendered = pixel_values_rendered.permute([0,3,1,2])  # [6, H, W, 3] -> [6, 3, H, W]
@@ -1059,6 +1071,10 @@ def main():
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
+
+                # Clear cache to prevent memory buildup
+                if global_step % 50 == 0:  # Clear cache every 50 steps
+                    torch.cuda.empty_cache()
 
             logs = {"SL": loss.detach().item(), 
                     "SL_D": disparity_loss.detach().item(), 
