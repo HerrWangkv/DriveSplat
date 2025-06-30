@@ -49,8 +49,8 @@ RUN pip install git+https://github.com/facebookresearch/pytorch3d.git
 # Remove the copied requirements.txt file
 RUN rm requirements.txt
 
-# Install squashfuse
-RUN apt-get update && apt-get install -y squashfuse fuse && rm -rf /var/lib/apt/lists/*
+# Install squashfuse and ffmpeg
+RUN apt-get update && apt-get install -y squashfuse fuse ffmpeg && rm -rf /var/lib/apt/lists/*
 
 # Copy the rest of the application
 COPY . .

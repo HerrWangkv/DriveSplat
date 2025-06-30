@@ -51,7 +51,7 @@ data:
     version: v1.0-trainval
     dataroot: ${...dataroot}
     cache_dir: ${...cache}
-    split: 83
+    split: 0
     view_order: ${...cameras}
     N: ${...interpolated_frame_between_keyframes}
     height: ${...height}

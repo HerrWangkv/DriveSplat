@@ -500,7 +500,6 @@ def render_novel_view(
     # Extract RGB and depth
     novel_images = rendered[..., :3]  # (B, H, W, 3)
     if not render_depth:
-        breakpoint()
         return paste_ego_area(current_images, current_ego_mask, novel_images)
     # Extract depth from rasterizer's z-buffer
     # The rasterizer provides depth information through its fragments

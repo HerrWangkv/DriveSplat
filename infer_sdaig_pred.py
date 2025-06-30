@@ -1,7 +1,6 @@
 import logging
 import os
 import argparse
-import logging
 from contextlib import nullcontext
 
 import torch
@@ -22,6 +21,7 @@ from utils.img_utils import (
     set_inf_to_max,
 )
 from utils.nvs_utils import render_novel_view
+from utils.video_utils import create_videos_from_images
 from third_party.Lotus.utils.seed_all import seed_all
 
 check_min_version('0.28.0.dev0')
@@ -102,6 +102,30 @@ def parse_args():
         choices=["bilinear", "bicubic", "nearest"],
         default="bilinear",
         help="Resampling method used to resize images and depth predictions. This can be one of `bilinear`, `bicubic` or `nearest`. Default: `bilinear`",
+    )
+
+    # Video creation arguments
+    parser.add_argument(
+        "--create_videos",
+        action="store_true",
+        help="Create videos from generated images after inference",
+    )
+    parser.add_argument(
+        "--video_fps",
+        type=int,
+        default=1,
+        help="Frames per second for generated videos",
+    )
+    parser.add_argument(
+        "--video_quality",
+        choices=["high", "medium", "low"],
+        default="high",
+        help="Video quality for generated videos",
+    )
+    parser.add_argument(
+        "--create_comparison_videos",
+        action="store_true",
+        help="Create side-by-side comparison videos",
     )
 
     args = parser.parse_args()
@@ -235,20 +259,57 @@ def main():
     with torch.no_grad():
         for frame, data in enumerate(tqdm(dataloader)):
             data = {k: v.to(device) for k, v in data.items()}
+            if frame == 0:
+                concat_6_views(
+                    (data["pixel_values", 0][0] + 1) / 2,  # Normalize to [0, 1]
+                ).save(os.path.join(output_dir, f"{frame:04d}_rgb_gt.png"))
+                concat_6_views(
+                    (data["pixel_values", 0][0] + 1) / 2,  # Normalize to [0, 1]
+                ).save(os.path.join(output_dir, f"{frame:04d}_rgb_out.png"))
+                if torch.backends.mps.is_available():
+                    autocast_ctx = nullcontext()
+                else:
+                    autocast_ctx = torch.autocast(pipeline.device.type)
+                with autocast_ctx:
+                    if args.multi_step:
+                        preds = pipeline(
+                            disparity_cond=data["box_disparity_maps", 0][0],
+                            rgb_cond=data["pixel_values", 0].squeeze() * 2 - 1,
+                            prompt=[
+                                "" for _ in range(data["pixel_values", 0].shape[1])
+                            ],
+                            num_inference_steps=args.num_inference_steps,
+                            generator=generator,
+                            output_type="np",
+                        ).images
+                    else:
+                        preds = pipeline(
+                            disparity_cond=data["box_disparity_maps", 0][0],
+                            rgb_cond=data["pixel_values", 0].squeeze() * 2 - 1,
+                            prompt=[
+                                "" for _ in range(data["pixel_values", 0].shape[1])
+                            ],
+                            num_inference_steps=1,
+                            generator=generator,
+                            output_type="np",
+                            timesteps=[args.timestep],
+                        ).images
+                _, disparity_out = np.split(preds, 2, axis=0)  # [6, H, W, 3]
+                disparity_out = disparity_out.mean(axis=-1)  # [6, H, W]
+                rgb_out = (data[("pixel_values", 0)].squeeze() + 1) / 2
             pixel_values_rendered = render_novel_view(
-                (data[("pixel_values", 0)].squeeze() + 1) / 2,
-                set_inf_to_max(
-                    disparity2depth((data[("disparity_maps", 0)].squeeze() + 1) / 2)
-                ),
-                data["ego_masks"].squeeze(),
-                data["intrinsics"].squeeze(),
-                data["extrinsics", 0].squeeze(),
-                data["intrinsics"].squeeze(),
-                data["extrinsics", 1].squeeze(),
-                data["objs_to_world", 0].squeeze(),
-                data["box_sizes", 0].squeeze(),
-                data["transforms", 0, 1].squeeze(),
-                (dataset_cfg.height, dataset_cfg.width),
+                current_images=rgb_out,
+                current_depths=set_inf_to_max(disparity2depth(disparity_out)),
+                current_ego_mask=data["ego_masks"].squeeze(),
+                current_intrinsics=data["intrinsics"].squeeze(),
+                current_extrinsics=data["extrinsics", 0].squeeze(),
+                novel_intrinsics=data["intrinsics"].squeeze(),
+                novel_extrinsics=data["extrinsics", 1].squeeze(),
+                current_objs_to_world=data["objs_to_world", 0].squeeze(),
+                current_box_sizes=data["box_sizes", 0].squeeze(),
+                transforms_cur_to_next=data["transforms", 0, 1].squeeze(),
+                expanding_factor=1.5,
+                image_size=(dataset_cfg.height, dataset_cfg.width),
                 render_depth=False,
             )
 
@@ -276,7 +337,7 @@ def main():
                     # Single-step inference
                     preds = pipeline(
                         disparity_cond=data["box_disparity_maps", 1][0],
-                        rgb_cond=pixel_values_rendered,
+                        rgb_cond=pixel_values_rendered * 2 - 1,
                         prompt=["" for _ in range(data["pixel_values", 1].shape[1])],
                         num_inference_steps=1,
                         generator=generator,
@@ -311,10 +372,19 @@ def main():
                 concat_6_views(
                     rgb_out,
                 ).save(os.path.join(output_dir, f"{frame+1:04d}_rgb_out.png"))
-            breakpoint()
             torch.cuda.empty_cache()
-
+            if frame == 6:
+                break
     print('==> Inference is done. \n==> Results saved to:', args.output_dir)
+
+    # Create videos if requested
+    if args.create_videos:
+        create_videos_from_images(
+            args.output_dir,
+            fps=args.video_fps,
+            quality=args.video_quality,
+            create_comparison=args.create_comparison_videos,
+        )
 
 
 if __name__ == '__main__':
