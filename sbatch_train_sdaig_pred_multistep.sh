@@ -2,7 +2,7 @@
 #SBATCH --job-name=drivesplat_train
 #SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=8  # 2 CPUs per GPU (4 GPUs per node)
+#SBATCH --cpus-per-task=32  # 8 CPUs per GPU (4 GPUs per node)
 #SBATCH --gres=gpu:4
 #SBATCH --time=48:00:00
 #SBATCH --partition=accelerated
