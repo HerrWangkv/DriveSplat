@@ -263,9 +263,20 @@ def main():
                 concat_6_views(
                     (data["pixel_values", 0][0] + 1) / 2,  # Normalize to [0, 1]
                 ).save(os.path.join(output_dir, f"{frame:04d}_rgb_gt.png"))
-                concat_6_views(
-                    (data["pixel_values", 0][0] + 1) / 2,  # Normalize to [0, 1]
-                ).save(os.path.join(output_dir, f"{frame:04d}_rgb_out.png"))
+                concat_and_visualize_6_depths(
+                    set_inf_to_max(
+                        disparity2depth((data["disparity_maps", 0][0] + 1) / 2)
+                    ),
+                    save_path=os.path.join(output_dir, f"{frame:04d}_depth_gt.png"),
+                    vmax=50,
+                )
+                concat_and_visualize_6_depths(
+                    set_inf_to_max(
+                        disparity2depth((data["box_disparity_maps", 0][0] + 1) / 2)
+                    ),
+                    save_path=os.path.join(output_dir, f"{frame:04d}_depth_cond.png"),
+                    vmax=50,
+                )
                 if torch.backends.mps.is_available():
                     autocast_ctx = nullcontext()
                 else:
@@ -274,7 +285,7 @@ def main():
                     if args.multi_step:
                         preds = pipeline(
                             disparity_cond=data["box_disparity_maps", 0][0],
-                            rgb_cond=data["pixel_values", 0].squeeze() * 2 - 1,
+                            rgb_cond=data["pixel_values", 0][0],
                             prompt=[
                                 "" for _ in range(data["pixel_values", 0].shape[1])
                             ],
@@ -285,7 +296,7 @@ def main():
                     else:
                         preds = pipeline(
                             disparity_cond=data["box_disparity_maps", 0][0],
-                            rgb_cond=data["pixel_values", 0].squeeze() * 2 - 1,
+                            rgb_cond=data["pixel_values", 0][0],
                             prompt=[
                                 "" for _ in range(data["pixel_values", 0].shape[1])
                             ],
@@ -294,9 +305,20 @@ def main():
                             output_type="np",
                             timesteps=[args.timestep],
                         ).images
-                _, disparity_out = np.split(preds, 2, axis=0)  # [6, H, W, 3]
+                rgb_out, disparity_out = np.split(preds, 2, axis=0)  # [6, H, W, 3]
                 disparity_out = disparity_out.mean(axis=-1)  # [6, H, W]
-                rgb_out = (data[("pixel_values", 0)].squeeze() + 1) / 2
+                concat_and_visualize_6_depths(
+                    set_inf_to_max(disparity2depth(disparity_out)),
+                    save_path=os.path.join(output_dir, f"{frame:04d}_depth_out.png"),
+                    vmax=50,
+                )
+                rgb_out = rgb_out.transpose(0, 3, 1, 2)  # [6, H, W, 3] -> [6, 3, H, W]
+                concat_6_views(
+                    rgb_out,
+                ).save(os.path.join(output_dir, f"{frame:04d}_rgb_out.png"))
+                rgb_out = (
+                    data[("pixel_values", 0)].squeeze() + 1
+                ) / 2  # Use original pixel values for rendering
             pixel_values_rendered = render_novel_view(
                 current_images=rgb_out,
                 current_depths=set_inf_to_max(disparity2depth(disparity_out)),
@@ -316,6 +338,16 @@ def main():
             pixel_values_rendered = pixel_values_rendered.permute([0,3,1,2])  # [6, H, W, 3] -> [6, 3, H, W]
             concat_6_views(pixel_values_rendered).save(
                 os.path.join(args.output_dir, f"{frame+1:04d}_rgb_cond.png")
+            )
+
+            concat_and_visualize_6_depths(
+                set_inf_to_max(
+                    disparity2depth((data["box_disparity_maps", 1][0] + 1) / 2)
+                ),
+                save_path=os.path.join(
+                    args.output_dir, f"{frame+1:04d}_depth_cond.png"
+                ),
+                vmax=50,
             )
             if torch.backends.mps.is_available():
                 autocast_ctx = nullcontext()
@@ -351,20 +383,16 @@ def main():
                 disparity_out = disparity_out.mean(axis=-1)  # [B, H, W]
                 rgb_out = rgb_out.transpose(0, 3, 1, 2)  # [B, 3, H, W]
 
-                disparity_out[disparity_out < 0.005] = (
-                    0.005  # Thresholding to remove noise
-                )
-                depth_out = disparity2depth(disparity_out)
                 concat_and_visualize_6_depths(
-                    depth_out,
+                    set_inf_to_max(disparity2depth(disparity_out)),
                     save_path=os.path.join(output_dir, f"{frame+1:04d}_depth_out.png"),
+                    vmax=50,
                 )
                 disparity_gt = (data["disparity_maps", 1][0].cpu().numpy() + 1) / 2
-                depth_gt = disparity2depth(disparity_gt)
-                depth_gt = set_inf_to_max(depth_gt)
                 concat_and_visualize_6_depths(
-                    depth_gt,
+                    set_inf_to_max(disparity2depth(disparity_gt)),
                     save_path=os.path.join(output_dir, f"{frame+1:04d}_depth_gt.png"),
+                    vmax=50,
                 )
                 concat_6_views(
                     (data["pixel_values", 1][0] + 1) / 2,  # Normalize to [0, 1]
