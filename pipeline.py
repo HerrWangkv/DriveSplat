@@ -1705,6 +1705,7 @@ class SDaIGControlNetPipeline(DirectDiffusionControlNetPipeline):
                 return_dict=False,
                 generator=generator,
             )[0]
+            torch.cuda.empty_cache()
             image, has_nsfw_concept = self.run_safety_checker(
                 image, device, prompt_embeds.dtype
             )

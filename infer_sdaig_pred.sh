@@ -7,8 +7,8 @@ squashfuse /data/cache.sqfs /data/cache
 
 export CUDA=0
 
-export CHECKPOINT_DIR="output/box_depth&render_wo_moving_objects/checkpoint-20000"
-export OUTPUT_DIR="output/infer-box_depth&render_wo_moving_objects"
+export CHECKPOINT_DIR="output/box_depth&render_w_moving_objects/final"
+export OUTPUT_DIR="output/infer-box_depth&render_w_moving_objects"
 export DATASET_CONFIG="data/NuScenes/sdaig.yaml"
 export MAX_TIMESTEPS=1000
 export NUM_INFERENCE_STEPS=20
