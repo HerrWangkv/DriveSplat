@@ -10,4 +10,4 @@ docker run -it --rm --gpus all --name sdaig \
   -v /storage_local/kwang/nuscenes:/data \
   -w /workspace \
   drivesplat:latest  \
-  bash train_sdaig_pred_multistep.sh
+  bash train_sdaig_pred.sh

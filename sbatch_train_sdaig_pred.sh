@@ -187,4 +187,4 @@ srun apptainer exec --nv \
   --bind "${MOUNT_PATH_CACHE}:/data/cache" \
   --pwd /workspace \
   drivesplat.sif \
-  bash train_sdaig_pred_multistep_multinode.sh
+  bash train_sdaig_pred_multinode.sh
