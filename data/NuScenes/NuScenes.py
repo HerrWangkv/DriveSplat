@@ -987,7 +987,6 @@ class SDaIGNuScenesDataset(Dataset):
             # No moving objects
             ret["objs_to_world", 0] = torch.empty(0, 4, 4).float()
             ret["box_sizes", 0] = torch.empty(0, 3).float()
-            ret["box_sizes", 1] = torch.empty(0, 3).float()
             ret["transforms", 0, 1] = torch.empty(0, 4, 4).float()
         else:
             # Get objects in the next frame
@@ -1058,13 +1057,11 @@ class SDaIGNuScenesDataset(Dataset):
                     np.stack(objs_to_world_0)
                 ).float()
                 ret["box_sizes", 0] = torch.tensor(box_sizes_0).float()
-                ret["box_sizes", 1] = torch.tensor(box_sizes_1).float()
                 ret["transforms", 0, 1] = torch.stack(transforms, dim=0)
             else:
                 # No common objects found
                 ret["objs_to_world", 0] = torch.empty(0, 4, 4).float()
                 ret["box_sizes", 0] = torch.empty(0, 3).float()
-                ret["box_sizes", 1] = torch.empty(0, 3).float()
                 ret["transforms", 0, 1] = torch.empty(0, 4, 4).float()
         return ret
 
@@ -1106,6 +1103,66 @@ class SDaIGNuScenesTrainDataset(SDaIGNuScenesDataset):
         ret["extrinsics", 0] = torch.stack(extrinsics0, dim=0)
         ret["extrinsics", 1] = torch.stack(extrinsics1, dim=0)
         ret.update(self.get_common_moving_objects_info(index, interval))
+        return {k: v.cpu().to(torch.float32) for k, v in ret.items()}
+
+
+class SDaIGNuScenesFinetuneDataset(SDaIGNuScenesDataset):
+    def __getitem__(self, index):
+        prev_interval = -1 if not self.is_first_frame(index) else 0
+        next_interval = 1 if not self.is_last_frame(index) else 0
+        ret = {}
+        ret["pixel_values", 0] = (
+            self.pixel_values[index + prev_interval]["pixel_values"] * 2 - 1
+        )  # Normalize to [-1, 1]
+        ret["pixel_values", 1] = (
+            self.pixel_values[index]["pixel_values"] * 2 - 1
+        )  # Normalize to [-1, 1]
+        ret["pixel_values", 2] = (
+            self.pixel_values[index + next_interval]["pixel_values"] * 2 - 1
+        )  # Normalize to [-1, 1]
+        ret["box_disparity_maps", 0] = (
+            self.box_disparity_maps[index + prev_interval]["box_disparity_maps"] * 2 - 1
+        )  # Normalize to [-1, 1]
+        ret["box_disparity_maps", 1] = (
+            self.box_disparity_maps[index]["box_disparity_maps"] * 2 - 1
+        )  # Normalize to [-1, 1]
+        ret["box_disparity_maps", 2] = (
+            self.box_disparity_maps[index + next_interval]["box_disparity_maps"] * 2 - 1
+        )  # Normalize to [-1, 1]
+        ret["ego_masks"] = self.ego_masks[index]["ego_masks"]
+        intrinsics = []
+        extrinsics0 = []
+        extrinsics1 = []
+        extrinsics2 = []
+        for cam in self.nusc.cameras:
+            intrinsics.append(
+                torch.tensor(
+                    self.nusc.get_camera_intrinsics(index, cam, img_size=self.img_size)
+                )
+            )
+            extrinsics0.append(
+                torch.tensor(self.nusc.get_world_to_cam(index + prev_interval, cam))
+            )
+            extrinsics1.append(torch.tensor(self.nusc.get_world_to_cam(index, cam)))
+            extrinsics2.append(
+                torch.tensor(self.nusc.get_world_to_cam(index + next_interval, cam))
+            )
+        ret["intrinsics"] = torch.stack(intrinsics, dim=0)
+        ret["extrinsics", 0] = torch.stack(extrinsics0, dim=0)
+        ret["extrinsics", 1] = torch.stack(extrinsics1, dim=0)
+        ret["extrinsics", 2] = torch.stack(extrinsics2, dim=0)
+        moving_objects_info_0_to_1 = self.get_common_moving_objects_info(
+            index + prev_interval, -prev_interval
+        )
+        moving_objects_info_1_to_2 = self.get_common_moving_objects_info(
+            index, next_interval
+        )
+        ret["objs_to_world", 0] = moving_objects_info_0_to_1["objs_to_world", 0]
+        ret["box_sizes", 0] = moving_objects_info_0_to_1["box_sizes", 0]
+        ret["transforms", 0, 1] = moving_objects_info_0_to_1["transforms", 0, 1]
+        ret["objs_to_world", 1] = moving_objects_info_1_to_2["objs_to_world", 0]
+        ret["box_sizes", 1] = moving_objects_info_1_to_2["box_sizes", 0]
+        ret["transforms", 1, 2] = moving_objects_info_1_to_2["transforms", 0, 1]
         return {k: v.cpu().to(torch.float32) for k, v in ret.items()}
 
 
