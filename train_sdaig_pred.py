@@ -1157,7 +1157,7 @@ def main():
             revision=args.revision,
             variant=args.variant,
         )
-        pipeline.save_pretrained(args.output_dir)
+        pipeline.save_pretrained(os.path.join(args.output_dir, "final"))
 
     accelerator.end_training()
 

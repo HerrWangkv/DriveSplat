@@ -3,7 +3,6 @@
 docker run -it --rm --gpus all --name sdaig \
   --privileged \
   --shm-size=8g \
-  -e WANDB_API_KEY="${WANDB_API_KEY}" \
   -v /storage_local/kwang/repos/DriveSplat:/workspace \
   -v /mrtstorage/datasets/public/nuscenes.sqfs:/data/nuscenes.sqfs \
   -v /mrtstorage/users/kwang/nuscenes_cache_10hz.sqfs:/data/cache.sqfs \
