@@ -49,7 +49,7 @@ RUN pip install git+https://github.com/facebookresearch/pytorch3d.git
 # Install additional dependencies
 RUN pip install git+https://github.com/nerfstudio-project/gsplat.git@v1.3.0
 RUN pip install git+https://github.com/NVlabs/nvdiffrast
-RUN pip install -e third_party/drivestudio/third_party/smplx
+
 
 # Remove the copied requirements.txt file
 RUN rm requirements.txt
