@@ -43,8 +43,13 @@ RUN pip install -r requirements.txt
 
 # Install PyTorch3D from source to support all GPU architectures
 ENV FORCE_CUDA=1
-ENV TORCH_CUDA_ARCH_LIST="6.0;6.1;7.0;7.5;8.0;8.6;8.9;9.0"
+ENV TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0"
 RUN pip install git+https://github.com/facebookresearch/pytorch3d.git
+
+# Install additional dependencies
+RUN pip install git+https://github.com/nerfstudio-project/gsplat.git@v1.3.0
+RUN pip install git+https://github.com/NVlabs/nvdiffrast
+RUN pip install -e third_party/drivestudio/third_party/smplx
 
 # Remove the copied requirements.txt file
 RUN rm requirements.txt

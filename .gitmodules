@@ -1,3 +1,6 @@
 [submodule "third_party/Lotus"]
 	path = third_party/Lotus
 	url = https://github.com/EnVision-Research/Lotus.git
+[submodule "third_party/drivestudio"]
+	path = third_party/drivestudio
+	url = https://github.com/ziyc/drivestudio.git

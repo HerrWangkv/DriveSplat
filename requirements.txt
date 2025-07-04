@@ -27,3 +27,17 @@ transformers==4.40.1
 omegaconf==2.3.0
 nuscenes-devkit==1.1.9
 wandb==0.20.1
+timm==0.9.5
+pytorch_msssim==1.0.0
+torchmetrics==0.10.3
+plotly==5.13.1
+viser==0.2.1
+scikit-image==0.20.0
+open3d==0.16.0
+pyquaternion==0.9.9
+chumpy
+kornia==0.7.2
+tqdm
+gdown
+nerfview==0.0.3
+lpips==0.1.4
