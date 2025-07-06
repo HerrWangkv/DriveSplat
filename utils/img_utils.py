@@ -4,32 +4,7 @@ import torch
 from PIL import Image
 from typing import Tuple
 import matplotlib.pyplot as plt
-
-
-def img_concat_h(im1, *args, color="black"):
-    if len(args) == 1:
-        im2 = args[0]
-    else:
-        im2 = img_concat_h(*args)
-    height = max(im1.height, im2.height)
-    mode = im1.mode
-    dst = Image.new(mode, (im1.width + im2.width, height), color=color)
-    dst.paste(im1, (0, 0))
-    dst.paste(im2, (im1.width, 0))
-    return dst
-
-
-def img_concat_v(im1, *args, color="black"):
-    if len(args) == 1:
-        im2 = args[0]
-    else:
-        im2 = img_concat_v(*args)
-    width = max(im1.width, im2.width)
-    mode = im1.mode
-    dst = Image.new(mode, (width, im1.height + im2.height), color=color)
-    dst.paste(im1, (0, 0))
-    dst.paste(im2, (0, im1.height))
-    return dst
+import torchvision.transforms as T
 
 
 def img_concat_h(im1, *args, color="black"):
@@ -161,3 +136,71 @@ def concat_and_visualize_6_depths(
     fig.colorbar(ims[0], cax=cbar_ax)
     plt.savefig(save_path)
     plt.close(fig)
+
+
+def get_augmentation_pipeline(apply_augmentation=True):
+    """Create augmentation pipeline with optional transforms"""
+    if not apply_augmentation:
+        return T.Compose([])
+
+    return T.Compose(
+        [
+            # Color jittering with small probability
+            T.RandomApply(
+                [T.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05)],
+                p=0.3,
+            ),
+            # Gaussian blur with small probability
+            T.RandomApply([T.GaussianBlur(kernel_size=3, sigma=(0.1, 0.5))], p=0.3),
+            # Motion blur simulation using random affine with small translation
+            T.RandomApply(
+                [
+                    T.RandomAffine(
+                        degrees=0, translate=(0.01, 0.01), scale=None, shear=None
+                    )
+                ],
+                p=0.2,
+            ),
+        ]
+    )
+
+
+def add_gaussian_noise(images, noise_std=0.02):
+    """Add gaussian noise to images"""
+    if noise_std > 0:
+        noise = torch.randn_like(images) * noise_std
+        return torch.clamp(images + noise, 0, 1)
+    return images
+
+
+def apply_augmentations_to_images(
+    images, enable_augmentation=True, gaussian_noise_std=0.02
+):
+    """
+    Apply data augmentations to a batch of images
+
+    Args:
+        images: torch.Tensor of shape [batch_size, 3, H, W] with values in [0, 1]
+        enable_augmentation: bool, whether to apply augmentations
+        gaussian_noise_std: float, standard deviation for gaussian noise
+
+    Returns:
+        torch.Tensor: augmented images with same shape and range
+    """
+    if not enable_augmentation:
+        return images
+
+    # Create augmentation pipeline
+    aug_pipeline = get_augmentation_pipeline(apply_augmentation=True)
+
+    # Apply augmentations to each image in the batch
+    augmented_images = []
+    for i in range(images.shape[0]):
+        img = images[i]  # [3, H, W]
+        # Apply transforms
+        img_aug = aug_pipeline(img)
+        # Add gaussian noise
+        img_aug = add_gaussian_noise(img_aug, gaussian_noise_std)
+        augmented_images.append(img_aug)
+
+    return torch.stack(augmented_images, dim=0)

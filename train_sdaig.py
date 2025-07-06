@@ -60,7 +60,8 @@ from data import build_dataset_from_cfg
 from utils.img_utils import (
     concat_6_views,
     disparity2depth,
-    depth2disparity,
+    add_gaussian_noise,
+    apply_augmentations_to_images,
     concat_and_visualize_6_depths,
     set_inf_to_max,
 )
@@ -78,11 +79,18 @@ logger = get_logger(__name__, log_level="INFO")
 def run_example_validation(pipeline, batch, args, step, generator):
 
     dataset_cfg = OmegaConf.load(args.dataset_config_path)
+    current_images = apply_augmentations_to_images(
+        images=(batch[("pixel_values", 0)].squeeze() + 1) / 2,
+        enable_augmentation=torch.rand(1).item() < 0.5,
+        gaussian_noise_std=torch.rand(1).item() * 0.05,
+    )
+    current_disparity_maps = add_gaussian_noise(
+        images=(batch[("disparity_maps", 0)].squeeze() + 1) / 2,
+        noise_std=torch.rand(1).item() * 0.05,
+    )
     pixel_values_rendered = render_novel_views_using_point_cloud(
-        current_images=(batch[("pixel_values", 0)].squeeze() + 1) / 2,
-        current_depths=set_inf_to_max(
-            disparity2depth((batch[("disparity_maps", 0)].squeeze() + 1) / 2)
-        ),
+        current_images=current_images,
+        current_depths=set_inf_to_max(disparity2depth(current_disparity_maps)),
         current_ego_mask=batch["ego_masks"].squeeze(),
         current_intrinsics=batch["intrinsics"].squeeze(),
         current_extrinsics=batch["extrinsics", 0].squeeze(),
@@ -888,12 +896,20 @@ def main():
                 if args.train_batch_size != 1:
                     raise NotImplemented
                 with torch.no_grad():
+                    current_images = apply_augmentations_to_images(
+                        images=(batch[("pixel_values", 0)].squeeze() + 1) / 2,
+                        enable_augmentation=torch.rand(1).item() < 0.5,
+                        gaussian_noise_std=torch.rand(1).item() * 0.05,
+                    )
+                    current_disparity_maps = add_gaussian_noise(
+                        images=(batch[("disparity_maps", 0)].squeeze() + 1) / 2,
+                        noise_std=torch.rand(1).item() * 0.05,
+                    )
+
                     pixel_values_rendered = render_novel_views_using_point_cloud(
-                        current_images=(batch[("pixel_values", 0)].squeeze() + 1) / 2,
+                        current_images=current_images,
                         current_depths=set_inf_to_max(
-                            disparity2depth(
-                                (batch[("disparity_maps", 0)].squeeze() + 1) / 2
-                            )
+                            disparity2depth(current_disparity_maps)
                         ),
                         current_ego_mask=batch["ego_masks"].squeeze(),
                         current_intrinsics=batch["intrinsics"].squeeze(),

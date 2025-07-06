@@ -26,7 +26,7 @@ export TOTAL_BSZ=$(($BATCH_SIZE * 8 * $GAS))  # 8 GPUs total across 2 nodes (4 p
 
 # model configs for multi-step training
 export MAX_TIMESTEPS=1000
-export VAL_STEP=500
+export VAL_STEP=1000
 export NUM_INFERENCE_STEPS=20  # Number of denoising steps during validation
 
 # output dir
