@@ -147,11 +147,11 @@ def get_augmentation_pipeline(apply_augmentation=True):
         [
             # Color jittering with small probability
             T.RandomApply(
-                [T.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05)],
+                [T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1)],
                 p=0.3,
             ),
             # Gaussian blur with small probability
-            T.RandomApply([T.GaussianBlur(kernel_size=3, sigma=(0.1, 0.5))], p=0.3),
+            T.RandomApply([T.GaussianBlur(kernel_size=5, sigma=(0.1, 0.5))], p=0.3),
             # Motion blur simulation using random affine with small translation
             T.RandomApply(
                 [
@@ -204,3 +204,29 @@ def apply_augmentations_to_images(
         augmented_images.append(img_aug)
 
     return torch.stack(augmented_images, dim=0)
+
+
+def multiply_each_disparity_by_different_factors(
+    disparities: torch.Tensor, min_factor=0.9, max_factor=1.1
+):
+    """
+    Multiply each disparity in the batch by a corresponding factor.
+
+    Args:
+        disparities: Tensor of shape [batch_size, 1, H, W] or [batch_size, H, W]
+        factors: Tensor of shape [batch_size] with multiplication factors
+
+    Returns:
+        Tensor with the same shape as input disparities, where each disparity
+        is multiplied by its corresponding factor.
+    """
+    # Generate random factors around 1 for each disparity in the batch
+    batch_size = disparities.shape[0]
+    # For example, uniform random factors in [min_factor, max_factor]
+    factors = torch.empty(batch_size, device=disparities.device).uniform_(
+        min_factor, max_factor
+    )
+    # Reshape for broadcasting
+    shape = [batch_size] + [1] * (disparities.dim() - 1)
+    factors = factors.view(*shape)
+    return torch.clamp(disparities * factors, 0, 1)  # Ensure values remain in [0, 1]

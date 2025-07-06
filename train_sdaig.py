@@ -60,7 +60,7 @@ from data import build_dataset_from_cfg
 from utils.img_utils import (
     concat_6_views,
     disparity2depth,
-    add_gaussian_noise,
+    multiply_each_disparity_by_different_factors,
     apply_augmentations_to_images,
     concat_and_visualize_6_depths,
     set_inf_to_max,
@@ -84,9 +84,8 @@ def run_example_validation(pipeline, batch, args, step, generator):
         enable_augmentation=torch.rand(1).item() < 0.5,
         gaussian_noise_std=torch.rand(1).item() * 0.05,
     )
-    current_disparity_maps = add_gaussian_noise(
-        images=(batch[("disparity_maps", 0)].squeeze() + 1) / 2,
-        noise_std=torch.rand(1).item() * 0.05,
+    current_disparity_maps = multiply_each_disparity_by_different_factors(
+        (batch[("disparity_maps", 0)].squeeze() + 1) / 2,
     )
     pixel_values_rendered = render_novel_views_using_point_cloud(
         current_images=current_images,
@@ -100,7 +99,7 @@ def run_example_validation(pipeline, batch, args, step, generator):
         current_box_sizes=batch["box_sizes", 0][0],
         current_obj_ids=batch["obj_ids", 0][0],
         transforms_cur_to_next=batch["transforms", 0, 1][0],
-        expanding_factor=1.5,
+        expanding_factor=1.0,
         image_size=(dataset_cfg.height, dataset_cfg.width),
         return_novel_depths=False,
     )["novel_images"]
@@ -901,9 +900,10 @@ def main():
                         enable_augmentation=torch.rand(1).item() < 0.5,
                         gaussian_noise_std=torch.rand(1).item() * 0.05,
                     )
-                    current_disparity_maps = add_gaussian_noise(
-                        images=(batch[("disparity_maps", 0)].squeeze() + 1) / 2,
-                        noise_std=torch.rand(1).item() * 0.05,
+                    current_disparity_maps = (
+                        multiply_each_disparity_by_different_factors(
+                            (batch[("disparity_maps", 0)].squeeze() + 1) / 2,
+                        )
                     )
 
                     pixel_values_rendered = render_novel_views_using_point_cloud(
@@ -920,7 +920,7 @@ def main():
                         current_box_sizes=batch["box_sizes", 0][0],
                         current_obj_ids=batch["obj_ids", 0][0],
                         transforms_cur_to_next=batch["transforms", 0, 1][0],
-                        expanding_factor=1.5,
+                        expanding_factor=1.0,
                         image_size=(dataset_cfg.height, dataset_cfg.width),
                         return_novel_depths=False,
                     )["novel_images"]
