@@ -280,7 +280,9 @@ def move_objects_in_pointcloud(
 
     if objects_to_world.shape[0] == 0:
         # No objects to transform
-        return moved_points
+        return moved_points, torch.full(
+            (points.shape[0],), -1, dtype=torch.long, device=device
+        )
 
     # Convert points to homogeneous coordinates
     homogeneous_points = torch.cat(
