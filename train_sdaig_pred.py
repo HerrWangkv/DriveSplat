@@ -64,7 +64,7 @@ from utils.img_utils import (
     concat_and_visualize_6_depths,
     set_inf_to_max,
 )
-from utils.nvs_utils import render_novel_view
+from utils.nvs_utils import render_novel_views_using_point_cloud
 
 import tensorboard
 
@@ -78,7 +78,7 @@ logger = get_logger(__name__, log_level="INFO")
 def run_example_validation(pipeline, batch, args, step, generator):
 
     dataset_cfg = OmegaConf.load(args.dataset_config_path)
-    pixel_values_rendered = render_novel_view(
+    pixel_values_rendered = render_novel_views_using_point_cloud(
         current_images=(batch[("pixel_values", 0)].squeeze() + 1) / 2,
         current_depths=set_inf_to_max(
             disparity2depth((batch[("disparity_maps", 0)].squeeze() + 1) / 2)
@@ -90,11 +90,12 @@ def run_example_validation(pipeline, batch, args, step, generator):
         novel_extrinsics=batch["extrinsics", 1].squeeze(),
         current_objs_to_world=batch["objs_to_world", 0][0],
         current_box_sizes=batch["box_sizes", 0][0],
+        current_obj_ids=batch["obj_ids", 0][0],
         transforms_cur_to_next=batch["transforms", 0, 1][0],
         expanding_factor=1.5,
         image_size=(dataset_cfg.height, dataset_cfg.width),
-        render_depth=False,
-    )
+        return_novel_depths=False,
+    )["novel_images"]
     pixel_values_rendered = pixel_values_rendered.permute([0,3,1,2])  # [6, H, W, 3] -> [6, 3, H, W]
     concat_6_views(pixel_values_rendered).save(
         os.path.join(args.output_dir, f"{step}_rgb_cond.png")
@@ -887,7 +888,7 @@ def main():
                 if args.train_batch_size != 1:
                     raise NotImplemented
                 with torch.no_grad():
-                    pixel_values_rendered = render_novel_view(
+                    pixel_values_rendered = render_novel_views_using_point_cloud(
                         current_images=(batch[("pixel_values", 0)].squeeze() + 1) / 2,
                         current_depths=set_inf_to_max(
                             disparity2depth(
@@ -901,11 +902,12 @@ def main():
                         novel_extrinsics=batch["extrinsics", 1].squeeze(),
                         current_objs_to_world=batch["objs_to_world", 0][0],
                         current_box_sizes=batch["box_sizes", 0][0],
+                        current_obj_ids=batch["obj_ids", 0][0],
                         transforms_cur_to_next=batch["transforms", 0, 1][0],
                         expanding_factor=1.5,
                         image_size=(dataset_cfg.height, dataset_cfg.width),
-                        render_depth=False,
-                    )
+                        return_novel_depths=False,
+                    )["novel_images"]
                     pixel_values_rendered = pixel_values_rendered.permute([0,3,1,2])  # [6, H, W, 3] -> [6, 3, H, W]
                 pixel_values = batch[("pixel_values", 1)]  # Shape: [batch_size, 6, 3, H, W]
                 disparity_maps = batch[("disparity_maps", 1)].expand(

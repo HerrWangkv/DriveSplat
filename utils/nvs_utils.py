@@ -21,7 +21,7 @@ def depth_to_pointcloud(depth: torch.Tensor,
                        ego_mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Convert depth map to 3D point cloud in world coordinates.
-    
+
     Args:
         depth: Depth map tensor of shape (H, W) or (B, H, W)
         intrinsics: Camera intrinsic matrix of shape (3, 3) or (B, 3, 3)
@@ -29,10 +29,10 @@ def depth_to_pointcloud(depth: torch.Tensor,
         rgb: Optional RGB image tensor of shape (H, W, 3) or (B, H, W, 3)
         ego_mask: Optional ego mask tensor of shape (H, W) or (B, H, W)
                   True/1 for ego pixels to be filtered out, False/0 for valid pixels
-    
+
     Returns:
-        points: 3D points in world coordinates (N, 3) or (B, N, 3)
-        colors: RGB colors for points (N, 3) or (B, N, 3), or None if rgb not provided
+        points: 3D points in world coordinates (N, 3)
+        colors: RGB colors for points (N, 3)
     """
     if depth.dim() == 2:
         depth = depth.unsqueeze(0)
@@ -146,6 +146,7 @@ def assign_points_to_objects(
     points: torch.Tensor,
     objects_to_world: torch.Tensor,
     box_sizes: torch.Tensor,
+    object_ids: torch.Tensor,
     expanding_factor: float = 1.0,
 ) -> torch.Tensor:
     """
@@ -156,6 +157,7 @@ def assign_points_to_objects(
         points: 3D points tensor of shape (N, 3)
         objects_to_world: Object transformation matrices of shape (M, 4, 4)
         box_sizes: Sizes of the boxes for each object of shape (M, 3) in [length, width, height]
+        object_ids: Object IDs for current objects, shape (M,) or None
         expanding_factor: Factor to expand the bounding boxes (default: 1.0, no expansion)
 
     Returns:
@@ -173,6 +175,7 @@ def assign_points_to_objects(
     for obj_idx in range(M):
         # Get object center in world coordinates (translation part of transformation matrix)
         obj_center_world = objects_to_world[obj_idx][:3, 3]  # Shape: (3,)
+        obj_id = object_ids[obj_idx]
 
         # For vertical objects, we primarily care about X-Y plane membership
         # Calculate X-Y bounds in world coordinates with expanding factor
@@ -244,7 +247,7 @@ def assign_points_to_objects(
         if inside_mask_candidates.any():
             candidate_indices = torch.where(candidate_mask)[0]
             final_indices = candidate_indices[inside_mask_candidates]
-            assignments[final_indices] = obj_idx
+            assignments[final_indices] = obj_id
 
     return assignments
 
@@ -253,6 +256,7 @@ def move_objects_in_pointcloud(
     points: torch.Tensor,
     objects_to_world: torch.Tensor,
     box_sizes: torch.Tensor,
+    object_ids: torch.Tensor,
     transforms_cur_to_next: torch.Tensor,
     expanding_factor: float = 1.0,
 ) -> torch.Tensor:
@@ -263,11 +267,13 @@ def move_objects_in_pointcloud(
         points: 3D points tensor of shape (N, 3)
         objects_to_world: Object transformation matrices of shape (M, 4, 4)
         box_sizes: Sizes of the boxes for each object of shape (M, 3)
+        object_ids: Object IDs for current objects, shape (M,) or None
         transforms_cur_to_next: Combined transformations (rotation + translation + scaling)
                                from current to next frame of shape (M, 4, 4)
         expanding_factor: Factor to expand the bounding boxes for point assignment (default: 1.0)
     Returns:
         moved_points: Points after applying transformations, shape (N, 3)
+        point_object_assignments: Tensor of shape (N,) with object indices.
     """
     device = points.device
     moved_points = points.clone()
@@ -286,13 +292,16 @@ def move_objects_in_pointcloud(
         points=points,
         objects_to_world=objects_to_world,
         box_sizes=box_sizes,
+        object_ids=object_ids,
         expanding_factor=expanding_factor,
     )
 
     # Transform points based on their object assignments
     for obj_idx in range(objects_to_world.shape[0]):
+        if transforms_cur_to_next[obj_idx].abs().sum() == 0:
+            continue  # No transformation for this object
         # Find points belonging to this object
-        point_mask = point_object_assignments == obj_idx
+        point_mask = point_object_assignments == object_ids[obj_idx]
         if not point_mask.any():
             continue
 
@@ -304,7 +313,7 @@ def move_objects_in_pointcloud(
         # Update the moved points for this object
         moved_points[point_mask] = transformed_points[:, :3]
 
-    return moved_points
+    return moved_points, point_object_assignments
 
 
 def paste_ego_area(
@@ -322,7 +331,7 @@ def paste_ego_area(
     return novel
 
 
-def render_novel_view(
+def render_novel_views_using_point_cloud(
     current_images: Union[torch.Tensor, np.ndarray],
     current_depths: Union[torch.Tensor, np.ndarray],
     current_ego_mask: torch.Tensor,
@@ -332,13 +341,15 @@ def render_novel_view(
     novel_extrinsics: torch.Tensor,
     current_objs_to_world: Optional[torch.Tensor] = None,
     current_box_sizes: Optional[torch.Tensor] = None,
+    current_obj_ids: Optional[torch.Tensor] = None,
     transforms_cur_to_next: Optional[torch.Tensor] = None,
     expanding_factor: float = 1.0,
     image_size: Tuple[int, int] = (512, 512),
     point_radius: float = 0.01,
     points_per_pixel: int = 8,
     background_color: Tuple[float, float, float] = (0.0, 0.0, 0.0),
-    render_depth: bool = True,
+    return_novel_depths: bool = True,
+    return_current_points: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Render novel view using PyTorch3D point cloud rendering with optional object movement.
@@ -355,18 +366,24 @@ def render_novel_view(
         novel_extrinsics: Novel view extrinsics, shape (B, 4, 4) or (4, 4)
         current_objs_to_world: Optional object-to-world matrices, shape (M, 4, 4)
         current_box_sizes: Optional object box sizes, shape (M, 3)
+        current_obj_ids: Optional object IDs for current objects, shape (M,) or None
         transforms_cur_to_next: Optional transformations from current to next frame, shape (M, 4, 4)
         expanding_factor: Factor to expand bounding boxes for point assignment (default: 1.0)
         image_size: Output image size (height, width)
         point_radius: Radius of rendered points
         points_per_pixel: Number of points to consider per pixel
         background_color: Background color (R, G, B) in range [0, 1]
-        render_depth: Whether to render depth maps
+        return_novel_depths: Whether to return depth maps for novel views
+        return_current_points: If True, returns the current point cloud as well
 
     Returns:
         novel_images: Novel view RGB images, shape (B, H, W, 3)
-        novel_depths: Novel view depth maps, shape (B, H, W)
+        novel_depths: Novel view depth maps (if return_novel_depths is True), shape (B, H, W)
+        cur_points: Current point cloud (if return_current_points is True), shape (N, 3)
+        cur_colors: Current point colors (if return_current_points is True), shape (N, 3)
+        cur_assignments: Current point assignments (if return_current_points is True), shape (N,)
     """
+    ret = {}
     # Convert numpy arrays to torch tensors if needed
     if isinstance(current_images, np.ndarray):
         current_images = torch.from_numpy(current_images).float()
@@ -409,6 +426,9 @@ def render_novel_view(
     # Convert depth maps to point clouds (concatenated from all cameras)
     points, colors = depth_to_pointcloud(current_depths, current_intrinsics, 
                                        current_extrinsics, current_images, current_ego_mask)
+    if return_current_points:
+        ret["cur_points"] = points.clone()  # Save current points if needed
+        ret["cur_colors"] = colors.clone()
 
     # Apply object movement if transformation data is provided
     if (
@@ -418,13 +438,16 @@ def render_novel_view(
     ):
 
         # Move objects in the point cloud based on transformations
-        points = move_objects_in_pointcloud(
+        points, assignments = move_objects_in_pointcloud(
             points=points,
             objects_to_world=current_objs_to_world,
             box_sizes=current_box_sizes,
+            object_ids=current_obj_ids,
             transforms_cur_to_next=transforms_cur_to_next,
             expanding_factor=expanding_factor,
         )
+        if return_current_points:
+            ret["cur_assignments"] = assignments.clone()
 
     # Create single PyTorch3D point cloud from all cameras
     # Filter out zero points
@@ -499,31 +522,31 @@ def render_novel_view(
 
     # Extract RGB and depth
     novel_images = rendered[..., :3]  # (B, H, W, 3)
-    if not render_depth:
-        return paste_ego_area(current_images, current_ego_mask, novel_images)
-    # Extract depth from rasterizer's z-buffer
-    # The rasterizer provides depth information through its fragments
-    # Re-rasterize to get fragments with depth information
-    fragments = rasterizer(point_cloud_batch)
-    # Extract depth from z-buffer - fragments.zbuf shape: (B, H, W, K) where K is points_per_pixel
-    zbuf = fragments.zbuf[..., 0]  # Take closest point depth: (B, H, W)
+    ret["novel_images"] = paste_ego_area(current_images, current_ego_mask, novel_images)
+    if return_novel_depths:
+        # Extract depth from rasterizer's z-buffer
+        # The rasterizer provides depth information through its fragments
+        # Re-rasterize to get fragments with depth information
+        fragments = rasterizer(point_cloud_batch)
+        # Extract depth from z-buffer - fragments.zbuf shape: (B, H, W, K) where K is points_per_pixel
+        zbuf = fragments.zbuf[..., 0]  # Take closest point depth: (B, H, W)
 
-    # Create depth mask - valid where zbuf > 0 (valid depth)
-    valid_depth_mask = zbuf > 0
+        # Create depth mask - valid where zbuf > 0 (valid depth)
+        valid_depth_mask = zbuf > 0
 
-    # Initialize depth maps
-    novel_depths = torch.ones(batch_size, *image_size, device=device) * float(
-        "inf"
-    )  # Set to inf initially
+        # Initialize depth maps
+        novel_depths = torch.ones(batch_size, *image_size, device=device) * float(
+            "inf"
+        )  # Set to inf initially
 
-    # Set depth values where valid
-    novel_depths[valid_depth_mask] = zbuf[valid_depth_mask]
+        # Set depth values where valid
+        novel_depths[valid_depth_mask] = zbuf[valid_depth_mask]
 
-    if squeeze_output:
-        novel_images = novel_images.squeeze(0)
-        novel_depths = novel_depths.squeeze(0)
-
-    return paste_ego_area(current_images, current_ego_mask, novel_images), novel_depths
+        if squeeze_output:
+            novel_images = novel_images.squeeze(0)
+            novel_depths = novel_depths.squeeze(0)
+        ret["novel_depths"] = novel_depths
+    return ret
 
 
 def create_camera_matrices(fx: float, fy: float, cx: float, cy: float,
