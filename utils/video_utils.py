@@ -131,47 +131,55 @@ def create_videos_from_images(output_dir, fps=10, quality='high', create_compari
         create_comparison: Whether to create side-by-side comparison videos
     """
     logging.info("Creating videos from generated images...")
-    
+
     # Check what types of RGB images we have (excluding depth)
     image_types = []
     for suffix in ['rgb_gt', 'rgb_out', 'rgb_cond']:
         pattern = os.path.join(output_dir, f"*_{suffix}.png")
         if glob.glob(pattern):
             image_types.append(suffix)
-            
+
     logging.info(f"Found RGB image types: {image_types}")
-    
+
     if not image_types:
         logging.warning("No RGB images found for video creation!")
         return
-        
+
     # Create individual videos
     success_count = 0
     for img_type in image_types:
         pattern = f"%04d_{img_type}.png"
         output_video = os.path.join(output_dir, f"{img_type}_video.mp4")
-        
+
         if create_video(output_dir, pattern, output_video, fps, quality):
             success_count += 1
-            
+
     logging.info(f"✓ Created {success_count}/{len(image_types)} individual RGB videos")
-    
+
     # Create comparison videos if requested (only RGB comparison)
     if create_comparison:
         comparisons = [
             ('rgb_gt', 'rgb_out', 'rgb_comparison'),
         ]
-        
+
         comparison_count = 0
         for gt_type, out_type, comp_name in comparisons:
             if gt_type in image_types and out_type in image_types:
                 gt_pattern = f"%04d_{gt_type}.png"
                 out_pattern = f"%04d_{out_type}.png"
                 output_video = os.path.join(output_dir, f"{comp_name}_video.mp4")
-                
+
                 if create_side_by_side_video(output_dir, gt_pattern, out_pattern, output_video, fps, quality):
                     comparison_count += 1
-                    
+
         logging.info(f"✓ Created {comparison_count} RGB comparison videos")
-        
+    # Remove all rgb_gt and rgb_out files
+    for suffix in ["rgb_gt", "rgb_out"]:
+        pattern = os.path.join(output_dir, f"*_{suffix}.png")
+        for file_path in glob.glob(pattern):
+            try:
+                os.remove(file_path)
+                logging.info(f"Removed file: {file_path}")
+            except Exception as e:
+                logging.warning(f"Could not remove file {file_path}: {e}")
     logging.info(f"🎬 All videos saved to: {output_dir}")

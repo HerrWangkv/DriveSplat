@@ -20,7 +20,7 @@ from utils.img_utils import (
     concat_and_visualize_6_depths,
     set_inf_to_max,
 )
-from utils.nvs_utils import render_novel_view
+from utils.nvs_utils import render_novel_views_using_point_cloud
 from utils.video_utils import create_videos_from_images
 from third_party.Lotus.utils.seed_all import seed_all
 
@@ -147,8 +147,8 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     logging.info(f"Output dir = {args.output_dir}")
 
-    output_dir = args.output_dir
-    if not os.path.exists(output_dir): os.makedirs(output_dir)
+    if not os.path.exists(args.output_dir):
+        os.makedirs(args.output_dir)
 
     # half_precision
     if args.half_precision:
@@ -176,7 +176,7 @@ def main():
 
     # -------------------- Data --------------------
     dataset_cfg = OmegaConf.load(args.dataset_config)
-    dataset = build_dataset_from_cfg(dataset_cfg.data.inference)
+    dataset = build_dataset_from_cfg(dataset_cfg.data.val)
     dataloader = DataLoader(
         dataset,
         batch_size=1,
@@ -257,24 +257,30 @@ def main():
 
     # -------------------- Inference and saving --------------------
     with torch.no_grad():
-        for frame, data in enumerate(tqdm(dataloader)):
+        for index, data in enumerate(tqdm(dataloader)):
             data = {k: v.to(device) for k, v in data.items()}
-            if frame == 0:
+            seq_idx, frame_idx = dataset.nusc.seq_indices[index]
+            if frame_idx == 0:
+                scene_idx = dataset.nusc.seqs[seq_idx]
+                output_dir = os.path.join(args.output_dir, f"{scene_idx:02d}")
+                os.makedirs(output_dir, exist_ok=True)
                 concat_6_views(
                     (data["pixel_values", 0][0] + 1) / 2,  # Normalize to [0, 1]
-                ).save(os.path.join(output_dir, f"{frame:04d}_rgb_gt.png"))
+                ).save(os.path.join(output_dir, f"{frame_idx:04d}_rgb_gt.png"))
                 concat_and_visualize_6_depths(
                     set_inf_to_max(
                         disparity2depth((data["disparity_maps", 0][0] + 1) / 2)
                     ),
-                    save_path=os.path.join(output_dir, f"{frame:04d}_depth_gt.png"),
+                    save_path=os.path.join(output_dir, f"{frame_idx:04d}_depth_gt.png"),
                     vmax=50,
                 )
                 concat_and_visualize_6_depths(
                     set_inf_to_max(
                         disparity2depth((data["box_disparity_maps", 0][0] + 1) / 2)
                     ),
-                    save_path=os.path.join(output_dir, f"{frame:04d}_depth_cond.png"),
+                    save_path=os.path.join(
+                        output_dir, f"{frame_idx:04d}_depth_cond.png"
+                    ),
                     vmax=50,
                 )
                 if torch.backends.mps.is_available():
@@ -309,17 +315,29 @@ def main():
                 disparity_out = disparity_out.mean(axis=-1)  # [6, H, W]
                 concat_and_visualize_6_depths(
                     set_inf_to_max(disparity2depth(disparity_out)),
-                    save_path=os.path.join(output_dir, f"{frame:04d}_depth_out.png"),
+                    save_path=os.path.join(
+                        output_dir, f"{frame_idx:04d}_depth_out.png"
+                    ),
                     vmax=50,
                 )
                 rgb_out = rgb_out.transpose(0, 3, 1, 2)  # [6, H, W, 3] -> [6, 3, H, W]
                 concat_6_views(
                     rgb_out,
-                ).save(os.path.join(output_dir, f"{frame:04d}_rgb_out.png"))
+                ).save(os.path.join(output_dir, f"{frame_idx:04d}_rgb_out.png"))
                 rgb_out = (
                     data[("pixel_values", 0)].squeeze() + 1
                 ) / 2  # Use original pixel values for rendering
-            pixel_values_rendered = render_novel_view(
+            elif frame_idx > 6:
+                # Create videos if requested
+                if frame_idx == 7 and args.create_videos:
+                    create_videos_from_images(
+                        output_dir,
+                        fps=args.video_fps,
+                        quality=args.video_quality,
+                        create_comparison=args.create_comparison_videos,
+                    )
+                continue
+            pixel_values_rendered = render_novel_views_using_point_cloud(
                 current_images=rgb_out,
                 current_depths=set_inf_to_max(disparity2depth(disparity_out)),
                 current_ego_mask=data["ego_masks"].squeeze(),
@@ -327,26 +345,25 @@ def main():
                 current_extrinsics=data["extrinsics", 0].squeeze(),
                 novel_intrinsics=data["intrinsics"].squeeze(),
                 novel_extrinsics=data["extrinsics", 1].squeeze(),
-                current_objs_to_world=data["objs_to_world", 0].squeeze(),
-                current_box_sizes=data["box_sizes", 0].squeeze(),
-                transforms_cur_to_next=data["transforms", 0, 1].squeeze(),
+                current_objs_to_world=data["objs_to_world", 0][0],
+                current_box_sizes=data["box_sizes", 0][0],
+                current_obj_ids=data["obj_ids", 0][0],
+                transforms_cur_to_next=data["transforms", 0, 1][0],
                 expanding_factor=1.5,
                 image_size=(dataset_cfg.height, dataset_cfg.width),
-                render_depth=False,
-            )
+                return_novel_depths=False,
+            )["novel_images"]
 
             pixel_values_rendered = pixel_values_rendered.permute([0,3,1,2])  # [6, H, W, 3] -> [6, 3, H, W]
             concat_6_views(pixel_values_rendered).save(
-                os.path.join(args.output_dir, f"{frame+1:04d}_rgb_cond.png")
+                os.path.join(output_dir, f"{frame_idx+1:04d}_rgb_cond.png")
             )
 
             concat_and_visualize_6_depths(
                 set_inf_to_max(
                     disparity2depth((data["box_disparity_maps", 1][0] + 1) / 2)
                 ),
-                save_path=os.path.join(
-                    args.output_dir, f"{frame+1:04d}_depth_cond.png"
-                ),
+                save_path=os.path.join(output_dir, f"{frame_idx+1:04d}_depth_cond.png"),
                 vmax=50,
             )
             if torch.backends.mps.is_available():
@@ -385,34 +402,27 @@ def main():
 
                 concat_and_visualize_6_depths(
                     set_inf_to_max(disparity2depth(disparity_out)),
-                    save_path=os.path.join(output_dir, f"{frame+1:04d}_depth_out.png"),
+                    save_path=os.path.join(
+                        output_dir, f"{frame_idx+1:04d}_depth_out.png"
+                    ),
                     vmax=50,
                 )
                 disparity_gt = (data["disparity_maps", 1][0].cpu().numpy() + 1) / 2
                 concat_and_visualize_6_depths(
                     set_inf_to_max(disparity2depth(disparity_gt)),
-                    save_path=os.path.join(output_dir, f"{frame+1:04d}_depth_gt.png"),
+                    save_path=os.path.join(
+                        output_dir, f"{frame_idx+1:04d}_depth_gt.png"
+                    ),
                     vmax=50,
                 )
                 concat_6_views(
                     (data["pixel_values", 1][0] + 1) / 2,  # Normalize to [0, 1]
-                ).save(os.path.join(output_dir, f"{frame+1:04d}_rgb_gt.png"))
+                ).save(os.path.join(output_dir, f"{frame_idx+1:04d}_rgb_gt.png"))
                 concat_6_views(
                     rgb_out,
-                ).save(os.path.join(output_dir, f"{frame+1:04d}_rgb_out.png"))
+                ).save(os.path.join(output_dir, f"{frame_idx+1:04d}_rgb_out.png"))
             torch.cuda.empty_cache()
-            if frame == 6:
-                break
     print('==> Inference is done. \n==> Results saved to:', args.output_dir)
-
-    # Create videos if requested
-    if args.create_videos:
-        create_videos_from_images(
-            args.output_dir,
-            fps=args.video_fps,
-            quality=args.video_quality,
-            create_comparison=args.create_comparison_videos,
-        )
 
 
 if __name__ == '__main__':
