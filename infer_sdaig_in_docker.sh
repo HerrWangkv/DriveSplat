@@ -9,4 +9,4 @@ docker run -it --rm --gpus all --name sdaig \
   -v /storage_local/kwang/nuscenes:/data \
   -w /workspace \
   drivesplat:latest  \
-  bash infer_sdaig_pred.sh
+  bash infer_sdaig.sh

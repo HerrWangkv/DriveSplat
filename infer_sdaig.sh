@@ -13,7 +13,7 @@ export DATASET_CONFIG="data/NuScenes/sdaig.yaml"
 export MAX_TIMESTEPS=1000
 export NUM_INFERENCE_STEPS=20
 
-CUDA_VISIBLE_DEVICES=$CUDA python infer_sdaig_pred.py \
+CUDA_VISIBLE_DEVICES=$CUDA python infer_sdaig.py \
         --pretrained_model_name_or_path=$CHECKPOINT_DIR \
         --dataset_config=$DATASET_CONFIG \
         --prediction_type="sample" \

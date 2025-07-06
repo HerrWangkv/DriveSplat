@@ -30,7 +30,7 @@ export VAL_STEP=500
 export NUM_INFERENCE_STEPS=20  # Number of denoising steps during validation
 
 # output dir
-export OUTPUT_DIR="output/train-sdaig-pred-multistep-bsz${TOTAL_BSZ}/"
+export OUTPUT_DIR="output/train-sdaig-bsz${TOTAL_BSZ}/"
 
 # Set machine rank based on hostname and head node
 current_hostname=$(hostname -s)
@@ -78,7 +78,7 @@ accelerate launch \
   --machine_rank=$MACHINE_RANK \
   --main_process_ip=$MASTER_ADDR \
   --main_process_port=$MASTER_PORT \
-  train_sdaig_pred.py \
+  train_sdaig.py \
   --pretrained_model_name_or_path=$MODEL_NAME \
   --dataset_config_path=$DATASET_CONFIG_PATH \
   --dataloader_num_workers=0 \
