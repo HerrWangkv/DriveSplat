@@ -349,7 +349,7 @@ def main():
                 current_box_sizes=data["box_sizes", 0][0],
                 current_obj_ids=data["obj_ids", 0][0],
                 transforms_cur_to_next=data["transforms", 0, 1][0],
-                expanding_factor=1.5,
+                expanding_factor=1.0,
                 image_size=(dataset_cfg.height, dataset_cfg.width),
                 return_novel_depths=False,
             )["novel_images"]

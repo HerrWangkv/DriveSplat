@@ -1226,7 +1226,7 @@ class SDaIGNuScenesTestDataset(SDaIGNuScenesDataset):
                 current_box_sizes=item["box_sizes", 0],
                 current_obj_ids=item["obj_ids", 0],
                 transforms_cur_to_next=item["transforms", 0, 1],
-                expanding_factor=1.5,
+                expanding_factor=1.0,
                 image_size=self.img_size,
             )
             novel_images = novel_info["novel_images"]
