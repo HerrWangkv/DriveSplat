@@ -76,22 +76,14 @@ logger = get_logger(__name__, log_level="INFO")
 
 
 @torch.no_grad()
-def run_example_validation(pipeline, batch, args, step, generator):
+def run_example_validation(pipeline, batch, args, step, generator, weight_dtype):
 
     dataset_cfg = OmegaConf.load(args.dataset_config_path)
-    current_features = vae.encode(batch[("pixel_values", 0)].squeeze().to(weight_dtype)).latent_dist.sample()
-    current_features *= vae.config.scaling_factor
-    current_features = add_gaussian_noise(
-        current_features,
-        noise_std=0.05,
-    )
+    current_features = pipeline.vae.encode(
+        batch[("pixel_values", 0)].squeeze().to(weight_dtype)
+    ).latent_dist.sample()
+    current_features *= pipeline.vae.config.scaling_factor
     current_disparity_maps = (batch[("disparity_maps", 0)].squeeze() + 1) / 2
-    current_disparity_maps = add_gaussian_noise(
-        current_disparity_maps,
-        noise_std=0.05,
-    )
-    current_disparity_maps = multiply_each_disparity_by_different_factors(
-            current_disparity_maps)
     novel_features = render_novel_views_using_point_cloud(
         current_features=current_features.float(),
         current_depths=set_inf_to_max(disparity2depth(current_disparity_maps)),
@@ -100,25 +92,47 @@ def run_example_validation(pipeline, batch, args, step, generator):
         current_extrinsics=batch["extrinsics", 0].squeeze(),
         novel_intrinsics=batch["latent_intrinsics"].squeeze(),
         novel_extrinsics=batch["extrinsics", 1].squeeze(),
+        point_radius=0.05,
+        points_per_pixel=8,
         current_objs_to_world=batch["objs_to_world", 0][0],
         current_box_sizes=batch["box_sizes", 0][0],
         current_obj_ids=batch["obj_ids", 0][0],
         transforms_cur_to_next=batch["transforms", 0, 1][0],
-        expanding_factor=1.0,
-        image_size=(dataset_cfg.height, dataset_cfg.width),
+        expanding_factor=1.5,
+        image_size=(
+            dataset_cfg.height // 8,
+            dataset_cfg.width // 8,
+        ),
+        background_color=(0, 0, 0, 0),
         return_novel_depths=False,
     )["novel_features"]
     novel_features = novel_features.permute([0,3,1,2])  # [6, H, W, 3] -> [6, 3, H, W]
-    novel_features = novel_features.to(weight_dtype)  # Convert back to weight_dtype
+    novel_features = novel_features.to(weight_dtype)
+    novel_images = pipeline.vae.decode(
+        novel_features / pipeline.vae.config.scaling_factor, return_dict=False
+    )[
+        0
+    ]  # [6, 3, H, W]
+    concat_6_views(
+        ((novel_images + 1) / 2).clamp(0, 1),
+    ).save(os.path.join(args.output_dir, f"{step}_rgb_cond.png"))
     concat_6_views(
         (batch["pixel_values", 1][0] + 1) / 2,  # Normalize to [0, 1]
     ).save(os.path.join(args.output_dir, f"{step}_rgb_gt.png"))
+
     disparity_gt = (batch["disparity_maps", 1][0].cpu().numpy() + 1) / 2
     depth_gt = disparity2depth(disparity_gt)
     depth_gt = set_inf_to_max(depth_gt)
     concat_and_visualize_6_depths(
         depth_gt,
         save_path=os.path.join(args.output_dir, f"{step}_depth_gt.png"),
+    )
+    box_disparity_gt = (batch["box_disparity_maps", 1][0].cpu().numpy() + 1) / 2
+    box_depth_gt = disparity2depth(box_disparity_gt)
+    box_depth_gt = set_inf_to_max(box_depth_gt)
+    concat_and_visualize_6_depths(
+        box_depth_gt,
+        save_path=os.path.join(args.output_dir, f"{step}_depth_cond.png"),
     )
     if torch.backends.mps.is_available():
         autocast_ctx = nullcontext()
@@ -134,7 +148,7 @@ def run_example_validation(pipeline, batch, args, step, generator):
                 prompt=["" for _ in range(batch["pixel_values", 1].shape[1])],
                 num_inference_steps=args.num_inference_steps,
                 generator=generator,
-                output_type="np",
+                output_type="latent",
             ).images
         else:
             # Single-step inference
@@ -144,19 +158,29 @@ def run_example_validation(pipeline, batch, args, step, generator):
                 prompt=["" for _ in range(batch["pixel_values", 1].shape[1])],
                 num_inference_steps=1,
                 generator=generator,
-                output_type="np",
+                output_type="latent",
                 timesteps=[args.timestep],
             ).images
-        rgb_out, disparity_out = np.split(preds, 2, axis=0)  # [6, H, W, 3]
-        disparity_out = disparity_out.mean(axis=-1)  # [B, H, W]
+        rgb_latents = preds[: len(preds) // 2]  # [B, 3, H//8, W//8]
+        latent_disparities = preds[len(preds) // 2 :]  # [B, 1, H//8, W//8]
+        rgb_out = pipeline.vae.decode(
+            rgb_latents / pipeline.vae.config.scaling_factor,
+            return_dict=False,
+            generator=generator,
+        )[0]
+        rgb_out = (rgb_out / 2 + 0.5).clamp(0, 1)  # Normalize to [0, 1]
 
-        depth_out = disparity2depth(disparity_out)
+        disparity_out = pipeline.decode_disparity(
+            latent_disparities, pipeline.device
+        )  # [B, 1, H//8, W//8]
+        disparity_out = (disparity_out / 2 + 0.5).clamp(0, 1)  # Normalize to [0, 1]
+
+        depth_out = set_inf_to_max(disparity2depth(disparity_out))
         concat_and_visualize_6_depths(
             depth_out,
             save_path=os.path.join(args.output_dir, f"{step}_depth_out.png"),
             vmax=np.max(depth_gt) if depth_gt is not None else None,
         )
-        rgb_out = rgb_out.transpose(0, 3, 1, 2)  # [B, 3, H, W]
         concat_6_views(
             rgb_out,
         ).save(os.path.join(args.output_dir, f"{step}_rgb_out.png"))
@@ -216,7 +240,7 @@ def log_validation(
     else:
         generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
 
-    run_example_validation(pipeline, batch, args, step, generator)
+    run_example_validation(pipeline, batch, args, step, generator, weight_dtype)
     del pipeline
     torch.cuda.empty_cache()
     # Force garbage collection to free memory
@@ -621,7 +645,7 @@ def main():
     else:
         logger.info("Initializing controlnet weights from unet")
         controlnet = ControlNetModel.from_unet(
-            unet, conditioning_channels=5, conditioning_embedding_out_channels=(256,)
+            unet, conditioning_channels=8, conditioning_embedding_out_channels=(256,)
         )
 
     # Initialize disparity encoder and decoder
@@ -848,7 +872,7 @@ def main():
     # Use main_process_first to ensure dataset is loaded consistently across all processes
     with accelerator.main_process_first():
         dataset_cfg = OmegaConf.load(args.dataset_config_path)
-        train_dataset = build_dataset_from_cfg(dataset_cfg.data.val)
+        train_dataset = build_dataset_from_cfg(dataset_cfg.data.train)
 
         if args.max_train_samples is not None:
             raise NotImplementedError(
@@ -1109,8 +1133,7 @@ def main():
                 bsz_per_task = int(bsz/2)
 
                 # Get the valid mask for the latent space
-                valid_mask = ~torch.max_pool2d(ego_masks.float(), 8, 8).bool()
-                valid_mask = valid_mask.repeat((1, 4, 1, 1))
+                valid_mask = ~ego_masks
 
                 # Sample noise that we'll add to the latents
                 rgb_noise = torch.randn_like(rgb_latents)
@@ -1158,7 +1181,8 @@ def main():
 
                 # Concatenate rgb and depth
                 controlnet_cond = torch.cat(
-                    [novel_features, latent_box_disparity_maps], dim=1
+                    [novel_features, disparity_encoder(latent_box_disparity_maps)],
+                    dim=1,
                 )  # [6*batch_size, 5, H, W]
                 controlnet_cond = torch.cat([controlnet_cond, controlnet_cond], dim=0)
                 controlnet_cond = controlnet_cond.to(weight_dtype)
@@ -1224,16 +1248,12 @@ def main():
 
                 # Decode predicted disparity latents and compute loss in disparity space
                 predicted_disparity_latents = model_pred[bsz_per_task:]
-                target_disparity_latents = latent_disparity_maps[:bsz_per_task]
-
                 predicted_disparity = disparity_decoder(predicted_disparity_latents)
-                target_disparity = disparity_decoder(target_disparity_latents)
+                target_disparity = latent_disparity_maps
 
                 disparity_loss = F.mse_loss(
-                    predicted_disparity[
-                        valid_mask[:, :1]
-                    ].float(),  # Use only first channel of valid_mask for disparity
-                    target_disparity[valid_mask[:, :1]].float(),
+                    predicted_disparity[valid_mask].float(),
+                    target_disparity[valid_mask].float(),
                     reduction="mean",
                 )
                 loss = disparity_loss + rgb_loss

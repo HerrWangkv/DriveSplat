@@ -12,7 +12,7 @@ export DATASET_CONFIG="data/NuScenes/latent_sdaig.yaml"
 
 # training configs
 export BATCH_SIZE=1
-export CUDA=0
+export CUDA=01234567
 export GAS=1
 export TOTAL_BSZ=$(($BATCH_SIZE * ${#CUDA} * $GAS))
 

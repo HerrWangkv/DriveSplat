@@ -1575,7 +1575,16 @@ class SDaIGControlNetPipeline(DirectDiffusionControlNetPipeline):
 
         # Resize image
         # 1. Default height and width to unet
-        height, width = rgb_cond.shape[2:]
+        if rgb_cond.shape[1] == 3:
+            height, width = rgb_cond.shape[2:]
+        elif rgb_cond.shape[1] == 4:
+            height, width = rgb_cond.shape[2:]
+            height *= 8
+            width *= 8
+        else:
+            raise ValueError(
+                f"Unsupported number of channels in rgb_cond: {rgb_cond.shape[1]}. Expected 3 or 4."
+            )
 
         controlnet = (
             self.controlnet._orig_mod
@@ -1764,17 +1773,9 @@ class SDaIGControlNetPipeline(DirectDiffusionControlNetPipeline):
             latents = torch.cat([latents[:, :4], latents[:, 4:]], dim=0)
         if not output_type == "latent":
             if self.disparity_decoder is not None:
-                image_latents = latents[: len(latents) // 2]
-                latent_disparities = latents[len(latents) // 2 :]
-                image = self.vae.decode(
-                    image_latents / self.vae.config.scaling_factor,
-                    return_dict=False,
-                    generator=generator,
-                )[0]
-                disparity = self.decode_disparity(latent_disparities, device).expand(
-                    -1, 3, -1, -1
+                raise ValueError(
+                    "output_type has to be 'latent' when using disparity decoder"
                 )
-                image = torch.cat([image, disparity], dim=0)
             else:
                 image = self.vae.decode(
                     latents / self.vae.config.scaling_factor,
