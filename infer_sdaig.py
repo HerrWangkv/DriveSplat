@@ -338,7 +338,7 @@ def main():
                     )
                 continue
             pixel_values_rendered = render_novel_views_using_point_cloud(
-                current_images=rgb_out,
+                current_features=rgb_out,
                 current_depths=set_inf_to_max(disparity2depth(disparity_out)),
                 current_ego_mask=data["ego_masks"].squeeze(),
                 current_intrinsics=data["intrinsics"].squeeze(),
@@ -352,7 +352,7 @@ def main():
                 expanding_factor=1.0,
                 image_size=(dataset_cfg.height, dataset_cfg.width),
                 return_novel_depths=False,
-            )["novel_images"]
+            )["novel_featureses"]
 
             pixel_values_rendered = pixel_values_rendered.permute([0,3,1,2])  # [6, H, W, 3] -> [6, 3, H, W]
             concat_6_views(pixel_values_rendered).save(

@@ -818,7 +818,8 @@ class NuScenesBoxDisparity(Dataset):
 
 
 class NuScenesDisparity(Dataset):
-    def __init__(self, nusc, img_size):
+
+    def __init__(self, nusc, img_size, use_latent=False):
         """
         Accurate disparity map using OmniRe
 
@@ -826,10 +827,12 @@ class NuScenesDisparity(Dataset):
             nusc: NuScenesBase instance
             height (int): Height of the disparity map
             width (int): Width of the disparity map
+            use_latent (bool): Whether to use depth for latent feature maps
         """
         super().__init__()
         self.nusc = nusc
         self.img_size = img_size
+        self.use_latent = use_latent
 
     def __len__(self):
         return len(self.nusc.lidar_data_tokens)
@@ -837,9 +840,14 @@ class NuScenesDisparity(Dataset):
     def __getitem__(self, index):
         seq_idx, frame_idx = self.nusc.seq_indices[index]
         scene_idx = self.nusc.seqs[seq_idx]
-        disparity_dir = os.path.join(
-            self.nusc.cache_dir, "disparity", f"{scene_idx:03d}"
-        )
+        if self.use_latent:
+            disparity_dir = os.path.join(
+                self.nusc.cache_dir, "latent_disparity", f"{scene_idx:03d}"
+            )
+        else:
+            disparity_dir = os.path.join(
+                self.nusc.cache_dir, "disparity", f"{scene_idx:03d}"
+            )
 
         disparity_maps = []
 
@@ -935,6 +943,7 @@ class NuScenesEgoMasks(Dataset):
 
 
 class SDaIGNuScenesDataset(Dataset):
+
     def __init__(
         self,
         version,
@@ -945,6 +954,7 @@ class SDaIGNuScenesDataset(Dataset):
         N,
         height,
         width,
+        use_latent=False,
         **kwargs,
     ):
         self.nusc = NuScenesBase(
@@ -957,10 +967,17 @@ class SDaIGNuScenesDataset(Dataset):
             **kwargs,
         )
         self.img_size = (height, width)
+        self.use_latent = use_latent
+        if use_latent:
+            self.latent_size = (height // 8, width // 8)
+        else:
+            self.latent_size = (height, width)
         self.pixel_values = NuScenesCameraImages(self.nusc, self.img_size)
-        self.box_disparity_maps = NuScenesBoxDisparity(self.nusc, self.img_size)
-        self.disparity_maps = NuScenesDisparity(self.nusc, self.img_size)
-        self.ego_masks = NuScenesEgoMasks(self.nusc, img_size=self.img_size)
+        self.box_disparity_maps = NuScenesBoxDisparity(self.nusc, self.latent_size)
+        self.disparity_maps = NuScenesDisparity(
+            self.nusc, self.latent_size, use_latent=use_latent
+        )
+        self.ego_masks = NuScenesEgoMasks(self.nusc, img_size=self.latent_size)
 
     def __len__(self):
         return len(self.nusc.lidar_data_tokens)
@@ -1101,6 +1118,8 @@ class SDaIGNuScenesTrainDataset(SDaIGNuScenesDataset):
         ).float()  # Normalize to [-1, 1]
         ret["ego_masks"] = self.ego_masks[index]["ego_masks"].bool()
         intrinsics = []
+        if self.use_latent:
+            latent_intrinsics = []
         extrinsics0 = []
         extrinsics1 = []
         for cam in self.nusc.cameras:
@@ -1109,11 +1128,21 @@ class SDaIGNuScenesTrainDataset(SDaIGNuScenesDataset):
                     self.nusc.get_camera_intrinsics(index, cam, img_size=self.img_size)
                 )
             )
+            if self.use_latent:
+                latent_intrinsics.append(
+                    torch.tensor(
+                        self.nusc.get_camera_intrinsics(
+                            index, cam, img_size=self.latent_size
+                        )
+                    )
+                )
             extrinsics0.append(torch.tensor(self.nusc.get_world_to_cam(index, cam)))
             extrinsics1.append(
                 torch.tensor(self.nusc.get_world_to_cam(index + interval, cam))
             )
         ret["intrinsics"] = torch.stack(intrinsics, dim=0).float()
+        if self.use_latent:
+            ret["latent_intrinsics"] = torch.stack(latent_intrinsics, dim=0).float()
         ret["extrinsics", 0] = torch.stack(extrinsics0, dim=0).float()
         ret["extrinsics", 1] = torch.stack(extrinsics1, dim=0).float()
         ret.update(self.get_moving_objects_info(index, interval))
@@ -1122,6 +1151,43 @@ class SDaIGNuScenesTrainDataset(SDaIGNuScenesDataset):
 
 class SDaIGNuScenesTestDataset(SDaIGNuScenesDataset):
     def __getitem__(self, index):
+        # seq_idx, frame_idx = self.nusc.seq_indices[index]
+        # if frame_idx > 6:
+        #     # Return dummy values for frames beyond the first 6 in the sequence
+        #     dummy_tensor = torch.zeros(
+        #         (6, 3, self.img_size[0], self.img_size[1])
+        #     ).float()
+        #     dummy_disparity = torch.zeros(
+        #         (6, 1, self.img_size[0], self.img_size[1])
+        #     ).float()
+        #     dummy_ego_masks = torch.zeros(
+        #         (6, 1, self.img_size[0], self.img_size[1])
+        #     ).bool()
+        #     dummy_intrinsics = torch.eye(3).unsqueeze(0).repeat(6, 1, 1).float()
+        #     dummy_extrinsics = torch.eye(4).unsqueeze(0).repeat(6, 1, 1).float()
+        #     dummy_objects = torch.empty(0, 4, 4).float()
+        #     dummy_box_sizes = torch.empty(0, 3).float()
+        #     dummy_object_ids = torch.empty(0).long()
+        #     dummy_deformable = torch.empty(0).bool()
+        #     dummy_transforms = torch.empty(0, 4, 4).float()
+
+        #     return {
+        #         ("pixel_values", 0): dummy_tensor,
+        #         ("pixel_values", 1): dummy_tensor,
+        #         ("box_disparity_maps", 0): dummy_disparity,
+        #         ("box_disparity_maps", 1): dummy_disparity,
+        #         ("disparity_maps", 0): dummy_disparity,
+        #         ("disparity_maps", 1): dummy_disparity,
+        #         "ego_masks": dummy_ego_masks,
+        #         "intrinsics": dummy_intrinsics,
+        #         ("extrinsics", 0): dummy_extrinsics,
+        #         ("extrinsics", 1): dummy_extrinsics,
+        #         ("objs_to_world", 0): dummy_objects,
+        #         ("box_sizes", 0): dummy_box_sizes,
+        #         ("obj_ids", 0): dummy_object_ids,
+        #         "deformable": dummy_deformable,
+        #         ("transforms", 0, 1): dummy_transforms,
+        #     }
         interval = 1 if not self.is_last_frame(index) else 0
         ret = {}
         ret["pixel_values", 0] = (
@@ -1144,6 +1210,8 @@ class SDaIGNuScenesTestDataset(SDaIGNuScenesDataset):
         ).float()  # Normalize to [-1, 1]
         ret["ego_masks"] = self.ego_masks[index]["ego_masks"].bool()
         intrinsics = []
+        if self.use_latent:
+            latent_intrinsics = []
         extrinsics0 = []
         extrinsics1 = []
         for cam in self.nusc.cameras:
@@ -1152,11 +1220,21 @@ class SDaIGNuScenesTestDataset(SDaIGNuScenesDataset):
                     self.nusc.get_camera_intrinsics(index, cam, img_size=self.img_size)
                 )
             )
+            if self.use_latent:
+                latent_intrinsics.append(
+                    torch.tensor(
+                        self.nusc.get_camera_intrinsics(
+                            index, cam, img_size=self.latent_size
+                        )
+                    )
+                )
             extrinsics0.append(torch.tensor(self.nusc.get_world_to_cam(index, cam)))
             extrinsics1.append(
                 torch.tensor(self.nusc.get_world_to_cam(index + interval, cam))
             )
         ret["intrinsics"] = torch.stack(intrinsics, dim=0).float()
+        if self.use_latent:
+            ret["latent_intrinsics"] = torch.stack(latent_intrinsics, dim=0).float()
         ret["extrinsics", 0] = torch.stack(extrinsics0, dim=0).float()
         ret["extrinsics", 1] = torch.stack(extrinsics1, dim=0).float()
         ret.update(self.get_moving_objects_info(index, interval))
@@ -1190,7 +1268,7 @@ class SDaIGNuScenesTestDataset(SDaIGNuScenesDataset):
         start_time = time.time()
         with torch.no_grad():
             novel_info = render_novel_views_using_point_cloud(
-                current_images=pixel_values,
+                current_features=pixel_values,
                 current_depths=set_inf_to_max(depth_maps).squeeze(),
                 current_ego_mask=ego_masks.squeeze(),
                 current_intrinsics=item["intrinsics"],
@@ -1199,7 +1277,7 @@ class SDaIGNuScenesTestDataset(SDaIGNuScenesDataset):
                 novel_extrinsics=item["extrinsics", 1],
                 image_size=self.img_size,
             )
-            novel_images = novel_info["novel_images"]
+            novel_images = novel_info["novel_features"]
             novel_depths = novel_info["novel_depths"]
         print(
             f"Novel view rendering (wo moving objects) took {time.time() - start_time:.2f} seconds"
@@ -1215,7 +1293,7 @@ class SDaIGNuScenesTestDataset(SDaIGNuScenesDataset):
         start_time = time.time()
         with torch.no_grad():
             novel_info = render_novel_views_using_point_cloud(
-                current_images=pixel_values,
+                current_features=pixel_values,
                 current_depths=set_inf_to_max(depth_maps).squeeze(),
                 current_ego_mask=ego_masks.squeeze(),
                 current_intrinsics=item["intrinsics"],
@@ -1229,7 +1307,7 @@ class SDaIGNuScenesTestDataset(SDaIGNuScenesDataset):
                 expanding_factor=1.0,
                 image_size=self.img_size,
             )
-            novel_images = novel_info["novel_images"]
+            novel_images = novel_info["novel_features"]
             novel_depths = novel_info["novel_depths"]
         print(
             f"Novel view rendering (w moving objects) took {time.time() - start_time:.2f} seconds"

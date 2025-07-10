@@ -165,11 +165,15 @@ def get_augmentation_pipeline(apply_augmentation=True):
     )
 
 
-def add_gaussian_noise(images, noise_std=0.02):
+def add_gaussian_noise(images, noise_std=0.02, clamp_range=None):
     """Add gaussian noise to images"""
     if noise_std > 0:
         noise = torch.randn_like(images) * noise_std
-        return torch.clamp(images + noise, 0, 1)
+        images = images + noise
+        if clamp_range is not None:
+            # Ensure images remain in clamp_range after adding noise
+            images = torch.clamp(images, clamp_range[0], clamp_range[1])
+        return images
     return images
 
 
@@ -200,7 +204,7 @@ def apply_augmentations_to_images(
         # Apply transforms
         img_aug = aug_pipeline(img)
         # Add gaussian noise
-        img_aug = add_gaussian_noise(img_aug, gaussian_noise_std)
+        img_aug = add_gaussian_noise(img_aug, gaussian_noise_std, clamp_range=(0, 1))
         augmented_images.append(img_aug)
 
     return torch.stack(augmented_images, dim=0)

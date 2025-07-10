@@ -14,11 +14,13 @@ from pytorch3d.renderer import (
 from pytorch3d.transforms import Transform3d
 
 
-def depth_to_pointcloud(depth: torch.Tensor, 
-                       intrinsics: torch.Tensor, 
-                       extrinsics: torch.Tensor,
-                       rgb: Optional[torch.Tensor] = None,
-                       ego_mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+def depth_to_pointcloud(
+    depth: torch.Tensor,
+    intrinsics: torch.Tensor,
+    extrinsics: torch.Tensor,
+    features: Optional[torch.Tensor] = None,
+    ego_mask: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Convert depth map to 3D point cloud in world coordinates.
 
@@ -26,13 +28,13 @@ def depth_to_pointcloud(depth: torch.Tensor,
         depth: Depth map tensor of shape (H, W) or (B, H, W)
         intrinsics: Camera intrinsic matrix of shape (3, 3) or (B, 3, 3)
         extrinsics: Camera extrinsic matrix of shape (4, 4) or (B, 4, 4)
-        rgb: Optional RGB image tensor of shape (H, W, 3) or (B, H, W, 3)
+        features: Optional feature tensor of shape (H, W, C) or (B, H, W, C)
         ego_mask: Optional ego mask tensor of shape (H, W) or (B, H, W)
                   True/1 for ego pixels to be filtered out, False/0 for valid pixels
 
     Returns:
         points: 3D points in world coordinates (N, 3)
-        colors: RGB colors for points (N, 3)
+        featues: features for points (N, C)
     """
     if depth.dim() == 2:
         depth = depth.unsqueeze(0)
@@ -76,7 +78,7 @@ def depth_to_pointcloud(depth: torch.Tensor,
         valid_mask = valid_mask & (~ego_mask.bool())
 
     points_list = []
-    colors_list = []
+    features_list = []
 
     for b in range(batch_size):
         valid_pixels = pixel_coords[b][valid_mask[b]]  # (N_valid, 3)
@@ -85,8 +87,8 @@ def depth_to_pointcloud(depth: torch.Tensor,
         if len(valid_pixels) == 0:
             # Handle case with no valid depth points
             points_list.append(torch.zeros((0, 3), device=device))
-            if rgb is not None:
-                colors_list.append(torch.zeros((0, 3), device=device))
+            if features is not None:
+                features_list.append(torch.zeros((0, 3), device=device))
             continue
 
         # Convert pixel coordinates to camera coordinates
@@ -101,45 +103,43 @@ def depth_to_pointcloud(depth: torch.Tensor,
         world_coords = torch.matmul(cam_coords_homo, torch.inverse(extrinsics[b]).T)
         points_list.append(world_coords[:, :3])
 
-        # Extract colors if provided
-        if rgb is not None:
-            # Handle batch dimension for RGB
-            if rgb.dim() == 3 and batch_size == 1:
+        # Extract features if provided
+        if features is not None:
+            # Handle batch dimension for features
+            if features.dim() == 3 and batch_size == 1:
                 # Single image case: (C, H, W) -> (1, C, H, W) -> (1, H, W, C)
-                rgb_batch = rgb.unsqueeze(0).permute(0, 2, 3, 1)
-            elif rgb.dim() == 4:
-                # Batch case: check format and convert if needed
-                if rgb.shape[1] == 3:  # (B, C, H, W) -> (B, H, W, C)
-                    rgb_batch = rgb.permute(0, 2, 3, 1)
-                else:  # Already (B, H, W, C)
-                    rgb_batch = rgb
+                features_batch = features.unsqueeze(0).permute(0, 2, 3, 1)
+            elif features.dim() == 4:
+                features_batch = features
             else:
                 # Already correct format or other case
-                rgb_batch = rgb
-                if rgb_batch.dim() == 3:  # (H, W, C) -> (1, H, W, C)
-                    rgb_batch = rgb_batch.unsqueeze(0)
+                features_batch = features
+                if features_batch.dim() == 3:  # (H, W, C) -> (1, H, W, C)
+                    features_batch = features_batch.unsqueeze(0)
 
-            # Now rgb_batch should be in (B, H, W, C) format
-            valid_colors = rgb_batch[b][valid_mask[b]]  # (N_valid, 3)
-            colors_list.append(valid_colors)
+            # Now features_batch should be in (B, H, W, C) format
+            valid_features = features_batch[b][valid_mask[b]]  # (N_valid, 3)
+            features_list.append(valid_features)
 
     # Concatenate results
     if squeeze_output and batch_size == 1:
         points = points_list[0]
-        colors = colors_list[0] if rgb is not None else None
+        features = features_list[0] if features is not None else None
     else:
         # Concatenate all points from different cameras
         if points_list:
             points = torch.cat(points_list, dim=0)  # (N_total, 3)
-            if rgb is not None:
-                colors = torch.cat(colors_list, dim=0)  # (N_total, 3)
+            if features is not None:
+                features = torch.cat(features_list, dim=0)  # (N_total, 3)
             else:
-                colors = None
+                features = None
         else:
             points = torch.zeros((0, 3), device=device)
-            colors = torch.zeros((0, 3), device=device) if rgb is not None else None
+            features = (
+                torch.zeros((0, 3), device=device) if features is not None else None
+            )
 
-    return points, colors
+    return points, features
 
 
 def assign_points_to_objects(
@@ -334,7 +334,7 @@ def paste_ego_area(
 
 
 def render_novel_views_using_point_cloud(
-    current_images: Union[torch.Tensor, np.ndarray],
+    current_features: Union[torch.Tensor, np.ndarray],
     current_depths: Union[torch.Tensor, np.ndarray],
     current_ego_mask: torch.Tensor,
     current_intrinsics: torch.Tensor,
@@ -357,7 +357,7 @@ def render_novel_views_using_point_cloud(
     Render novel view using PyTorch3D point cloud rendering with optional object movement.
 
     Args:
-        current_images: Current view RGB images, shape (B, C, H, W), (C, H, W), (B, H, W, C), or (H, W, C)
+        current_features: Current view RGB images or latents, shape (B, C, H, W), (C, H, W), (B, H, W, C), or (H, W, C)
                        Can be numpy array or torch tensor
         current_depths: Current view depth maps, shape (B, H, W) or (H, W)
                        Can be numpy array or torch tensor
@@ -374,43 +374,44 @@ def render_novel_views_using_point_cloud(
         image_size: Output image size (height, width)
         point_radius: Radius of rendered points
         points_per_pixel: Number of points to consider per pixel
-        background_color: Background color (R, G, B) in range [0, 1]
+        background_color: Background feature
         return_novel_depths: Whether to return depth maps for novel views
         return_current_points: If True, returns the current point cloud as well
 
     Returns:
-        novel_images: Novel view RGB images, shape (B, H, W, 3)
+        novel_features: Novel view RGB images or latents, shape (B, H, W, C)
         novel_depths: Novel view depth maps (if return_novel_depths is True), shape (B, H, W)
         cur_points: Current point cloud (if return_current_points is True), shape (N, 3)
-        cur_colors: Current point colors (if return_current_points is True), shape (N, 3)
+        cur_features: Current point features (if return_current_points is True), shape (N, 3)
         cur_assignments: Current point assignments (if return_current_points is True), shape (N,)
     """
     ret = {}
     # Convert numpy arrays to torch tensors if needed
-    if isinstance(current_images, np.ndarray):
-        current_images = torch.from_numpy(current_images).float()
+    if isinstance(current_features, np.ndarray):
+        current_features = torch.from_numpy(current_features).float()
     if isinstance(current_depths, np.ndarray):  
         current_depths = torch.from_numpy(current_depths).float()
 
     # Move to same device as intrinsics
     device = current_intrinsics.device
-    current_images = current_images.to(device)
+    current_features = current_features.to(device)
     current_depths = current_depths.to(device)
     current_ego_mask = current_ego_mask.to(device)
 
     # Ensure batch dimension and convert to (B, H, W, C) format for depth_to_pointcloud
-    if current_images.dim() == 3:
+    if current_features.dim() == 3:
         # Single image case (C, H, W) -> (1, H, W, C)
-        current_images = current_images.permute(1, 2, 0).unsqueeze(0)
+        current_features = current_features.permute(1, 2, 0).unsqueeze(0)
         batch_size = 1
         squeeze_output = True
-    elif current_images.dim() == 4:
-        assert current_images.shape[1] == 3  
-        current_images = current_images.permute(0, 2, 3, 1) # (B, C, H, W) -> (B, H, W, C)
-        batch_size = current_images.shape[0]
+    elif current_features.dim() == 4:
+        current_features = current_features.permute(
+            0, 2, 3, 1
+        )  # (B, C, H, W) -> (B, H, W, C)
+        batch_size = current_features.shape[0]
         squeeze_output = False
     else:
-        raise ValueError("current_images must be of shape (B, C, H, W) or (C, H, W)")
+        raise ValueError("current_features must be of shape (B, C, H, W) or (C, H, W)")
 
     if current_depths.dim() == 2:
         current_depths = current_depths.unsqueeze(0)
@@ -426,11 +427,16 @@ def render_novel_views_using_point_cloud(
         novel_extrinsics = novel_extrinsics.unsqueeze(0)
 
     # Convert depth maps to point clouds (concatenated from all cameras)
-    points, colors = depth_to_pointcloud(current_depths, current_intrinsics, 
-                                       current_extrinsics, current_images, current_ego_mask)
+    points, features = depth_to_pointcloud(
+        current_depths,
+        current_intrinsics,
+        current_extrinsics,
+        current_features,
+        current_ego_mask,
+    )
     if return_current_points:
         ret["cur_points"] = points.clone()  # Save current points if needed
-        ret["cur_colors"] = colors.clone()
+        ret["cur_features"] = features.clone()
 
     # Apply object movement if transformation data is provided
     if (
@@ -513,8 +519,8 @@ def render_novel_views_using_point_cloud(
 
     # Create replicated point clouds for batch rendering
     replicated_points = [points[valid_points_mask] for _ in range(batch_size)]
-    if colors is not None:
-        replicated_features = [colors[valid_points_mask] for _ in range(batch_size)]
+    if features is not None:
+        replicated_features = [features[valid_points_mask] for _ in range(batch_size)]
         point_cloud_batch = Pointclouds(points=replicated_points, features=replicated_features)
     else:
         point_cloud_batch = Pointclouds(points=replicated_points)
@@ -523,8 +529,10 @@ def render_novel_views_using_point_cloud(
     rendered = renderer(point_cloud_batch)
 
     # Extract RGB and depth
-    novel_images = rendered[..., :3]  # (B, H, W, 3)
-    ret["novel_images"] = paste_ego_area(current_images, current_ego_mask, novel_images)
+    novel_features = rendered  # (B, H, W, 3)
+    ret["novel_features"] = paste_ego_area(
+        current_features, current_ego_mask, novel_features
+    )
     if return_novel_depths:
         # Extract depth from rasterizer's z-buffer
         # The rasterizer provides depth information through its fragments
@@ -545,7 +553,7 @@ def render_novel_views_using_point_cloud(
         novel_depths[valid_depth_mask] = zbuf[valid_depth_mask]
 
         if squeeze_output:
-            novel_images = novel_images.squeeze(0)
+            novel_features = novel_features.squeeze(0)
             novel_depths = novel_depths.squeeze(0)
         ret["novel_depths"] = novel_depths
     return ret

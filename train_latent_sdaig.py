@@ -55,13 +55,13 @@ from diffusers.utils.import_utils import is_xformers_available
 from diffusers.utils.torch_utils import is_compiled_module
 from diffusers.models.controlnet import ControlNetModel
 
-from pipeline import SDaIGControlNetPipeline
+from pipeline import SDaIGControlNetPipeline, DisparityEncoder, DisparityDecoder
 from data import build_dataset_from_cfg
 from utils.img_utils import (
     concat_6_views,
     disparity2depth,
     multiply_each_disparity_by_different_factors,
-    apply_augmentations_to_images,
+    add_gaussian_noise,
     concat_and_visualize_6_depths,
     set_inf_to_max,
 )
@@ -79,21 +79,26 @@ logger = get_logger(__name__, log_level="INFO")
 def run_example_validation(pipeline, batch, args, step, generator):
 
     dataset_cfg = OmegaConf.load(args.dataset_config_path)
-    current_images = apply_augmentations_to_images(
-        images=(batch[("pixel_values", 0)].squeeze() + 1) / 2,
-        enable_augmentation=torch.rand(1).item() < 0.5,
-        gaussian_noise_std=torch.rand(1).item() * 0.05,
+    current_features = vae.encode(batch[("pixel_values", 0)].squeeze().to(weight_dtype)).latent_dist.sample()
+    current_features *= vae.config.scaling_factor
+    current_features = add_gaussian_noise(
+        current_features,
+        noise_std=0.05,
+    )
+    current_disparity_maps = (batch[("disparity_maps", 0)].squeeze() + 1) / 2
+    current_disparity_maps = add_gaussian_noise(
+        current_disparity_maps,
+        noise_std=0.05,
     )
     current_disparity_maps = multiply_each_disparity_by_different_factors(
-        (batch[("disparity_maps", 0)].squeeze() + 1) / 2,
-    )
-    pixel_values_rendered = render_novel_views_using_point_cloud(
-        current_features=current_images,
+            current_disparity_maps)
+    novel_features = render_novel_views_using_point_cloud(
+        current_features=current_features.float(),
         current_depths=set_inf_to_max(disparity2depth(current_disparity_maps)),
         current_ego_mask=batch["ego_masks"].squeeze(),
-        current_intrinsics=batch["intrinsics"].squeeze(),
+        current_intrinsics=batch["latent_intrinsics"].squeeze(),
         current_extrinsics=batch["extrinsics", 0].squeeze(),
-        novel_intrinsics=batch["intrinsics"].squeeze(),
+        novel_intrinsics=batch["latent_intrinsics"].squeeze(),
         novel_extrinsics=batch["extrinsics", 1].squeeze(),
         current_objs_to_world=batch["objs_to_world", 0][0],
         current_box_sizes=batch["box_sizes", 0][0],
@@ -103,10 +108,11 @@ def run_example_validation(pipeline, batch, args, step, generator):
         image_size=(dataset_cfg.height, dataset_cfg.width),
         return_novel_depths=False,
     )["novel_features"]
-    pixel_values_rendered = pixel_values_rendered.permute([0,3,1,2])  # [6, H, W, 3] -> [6, 3, H, W]
-    concat_6_views(pixel_values_rendered).save(
-        os.path.join(args.output_dir, f"{step}_rgb_cond.png")
-    )
+    novel_features = novel_features.permute([0,3,1,2])  # [6, H, W, 3] -> [6, 3, H, W]
+    novel_features = novel_features.to(weight_dtype)  # Convert back to weight_dtype
+    concat_6_views(
+        (batch["pixel_values", 1][0] + 1) / 2,  # Normalize to [0, 1]
+    ).save(os.path.join(args.output_dir, f"{step}_rgb_gt.png"))
     disparity_gt = (batch["disparity_maps", 1][0].cpu().numpy() + 1) / 2
     depth_gt = disparity2depth(disparity_gt)
     depth_gt = set_inf_to_max(depth_gt)
@@ -114,9 +120,6 @@ def run_example_validation(pipeline, batch, args, step, generator):
         depth_gt,
         save_path=os.path.join(args.output_dir, f"{step}_depth_gt.png"),
     )
-    concat_6_views(
-        (batch["pixel_values", 1][0] + 1) / 2,  # Normalize to [0, 1]
-    ).save(os.path.join(args.output_dir, f"{step}_rgb_gt.png"))
     if torch.backends.mps.is_available():
         autocast_ctx = nullcontext()
     else:
@@ -127,7 +130,7 @@ def run_example_validation(pipeline, batch, args, step, generator):
             # Multi-step inference with proper denoising steps
             preds = pipeline(
                 disparity_cond=batch["box_disparity_maps", 1][0],
-                rgb_cond=pixel_values_rendered * 2 - 1,
+                rgb_cond=novel_features,
                 prompt=["" for _ in range(batch["pixel_values", 1].shape[1])],
                 num_inference_steps=args.num_inference_steps,
                 generator=generator,
@@ -137,7 +140,7 @@ def run_example_validation(pipeline, batch, args, step, generator):
             # Single-step inference
             preds = pipeline(
                 disparity_cond=batch["box_disparity_maps", 1][0],
-                rgb_cond=pixel_values_rendered,
+                rgb_cond=novel_features,
                 prompt=["" for _ in range(batch["pixel_values", 1].shape[1])],
                 num_inference_steps=1,
                 generator=generator,
@@ -166,6 +169,8 @@ def log_validation(
     tokenizer,
     unet,
     controlnet,
+    disparity_encoder,
+    disparity_decoder,
     args,
     accelerator,
     weight_dtype,
@@ -191,6 +196,8 @@ def log_validation(
         safety_checker=None,
         feature_extractor=None,
         requires_safety_checker=False,
+        disparity_encoder=accelerator.unwrap_model(disparity_encoder),
+        disparity_decoder=accelerator.unwrap_model(disparity_decoder),
     )
 
     pipeline = pipeline.to(accelerator.device)
@@ -236,6 +243,18 @@ def parse_args():
         default=None,
         help="Path to pretrained controlnet model or model identifier from huggingface.co/models."
         " If not specified controlnet weights are initialized from unet.",
+    )
+    parser.add_argument(
+        "--disparity_encoder_model_name_or_path",
+        type=str,
+        default=None,
+        help="Path to pretrained disparity encoder model. If not specified, disparity encoder weights are initialized randomly.",
+    )
+    parser.add_argument(
+        "--disparity_decoder_model_name_or_path",
+        type=str,
+        default=None,
+        help="Path to pretrained disparity decoder model. If not specified, disparity decoder weights are initialized randomly.",
     )
     parser.add_argument(
         "--revision",
@@ -590,36 +609,70 @@ def main():
     )
 
     if args.controlnet_model_name_or_path:
-        logger.info("Loading existing controlnet weights")
+        logger.info(f"Loading controlnet from {args.controlnet_model_name_or_path}")
         controlnet = ControlNetModel.from_pretrained(args.controlnet_model_name_or_path)
+    elif args.pretrained_model_name_or_path and os.path.exists(
+        os.path.join(args.pretrained_model_name_or_path, "controlnet")
+    ):
+        logger.info("Loading controlnet weights from pretrained model path")
+        controlnet = ControlNetModel.from_pretrained(
+            args.pretrained_model_name_or_path, subfolder="controlnet"
+        )
     else:
         logger.info("Initializing controlnet weights from unet")
-        controlnet = ControlNetModel.from_unet(unet, conditioning_channels=4)
+        controlnet = ControlNetModel.from_unet(
+            unet, conditioning_channels=5, conditioning_embedding_out_channels=(256,)
+        )
 
-    # # Replace the first layer to accept 8 in_channels.
-    # _weight = unet.conv_in.weight.clone()
-    # _bias = unet.conv_in.bias.clone()
-    # _weight = _weight.repeat(1, 2, 1, 1)
-    # _weight *= 0.5
-    # # unet.config.in_channels *= 2
-    # config_dict = EasyDict(unet.config)
-    # config_dict.in_channels *= 2
-    # unet._internal_dict = config_dict
+    # Initialize disparity encoder and decoder
+    # Try loading from specific paths first, then check controlnet path, finally initialize new
+    if args.disparity_encoder_model_name_or_path:
+        logger.info(
+            f"Loading disparity encoder from {args.disparity_encoder_model_name_or_path}"
+        )
+        disparity_encoder = DisparityEncoder.from_pretrained(
+            args.disparity_encoder_model_name_or_path
+        )
+    elif args.pretrained_model_name_or_path and os.path.exists(
+        os.path.join(args.pretrained_model_name_or_path, "disparity_encoder")
+    ):
+        logger.info(
+            "Loading existing disparity encoder weights from pretrained model path"
+        )
+        disparity_encoder = DisparityEncoder.from_pretrained(
+            args.pretrained_model_name_or_path, subfolder="disparity_encoder"
+        )
+    else:
+        logger.info("Initializing new disparity encoder weights")
+        disparity_encoder = DisparityEncoder(in_channels=1, out_channels=4)
 
-    # # new conv_in channel
-    # _n_convin_out_channel = unet.conv_in.out_channels
-    # _new_conv_in =nn.Conv2d(
-    #     8, _n_convin_out_channel, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1)
-    # )
-    # _new_conv_in.weight = nn.Parameter(_weight)
-    # _new_conv_in.bias = nn.Parameter(_bias)
-    # unet.conv_in = _new_conv_in
+    if args.disparity_decoder_model_name_or_path:
+        logger.info(
+            f"Loading disparity decoder from {args.disparity_decoder_model_name_or_path}"
+        )
+        disparity_decoder = DisparityDecoder.from_pretrained(
+            args.disparity_decoder_model_name_or_path
+        )
+    elif args.pretrained_model_name_or_path and os.path.exists(
+        os.path.join(args.pretrained_model_name_or_path, "disparity_decoder")
+    ):
+        logger.info(
+            "Loading existing disparity decoder weights from pretrained model path"
+        )
+        disparity_decoder = DisparityDecoder.from_pretrained(
+            args.pretrained_model_name_or_path, subfolder="disparity_decoder"
+        )
+    else:
+        logger.info("Initializing new disparity decoder weights")
+        disparity_decoder = DisparityDecoder(in_channels=4, out_channels=1)
 
-    # Freeze vae and text_encoder and set unet and controlnet to trainable
+    # Freeze vae and text_encoder and set unet, controlnet, disparity_encoder, and disparity_decoder to trainable
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
     unet.train()
     controlnet.train()
+    disparity_encoder.train()
+    disparity_decoder.train()
 
     if args.enable_xformers_memory_efficient_attention:
         if is_xformers_available():
@@ -639,20 +692,32 @@ def main():
         # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
         def save_model_hook(models, weights, output_dir):
             if accelerator.is_main_process:
-                # Save both UNet and ControlNet
-                # The models list contains [unet, controlnet] in the order from accelerator.prepare()
-                if len(models) >= 2:
+                # Save UNet, ControlNet, and disparity encoder/decoder
+                # The models list contains [unet, controlnet, disparity_encoder, disparity_decoder] in the order from accelerator.prepare()
+                if len(models) >= 4:
                     unet_model = models[0]
                     controlnet_model = models[1]
+                    disparity_encoder_model = models[2]
+                    disparity_decoder_model = models[3]
 
                     unet_model.save_pretrained(os.path.join(output_dir, "unet"))
                     controlnet_model.save_pretrained(os.path.join(output_dir, "controlnet"))
 
-                    # Pop weights for both models
+                    # Save disparity encoder and decoder using their save_pretrained methods
+                    disparity_encoder_model.save_pretrained(
+                        os.path.join(output_dir, "disparity_encoder")
+                    )
+                    disparity_decoder_model.save_pretrained(
+                        os.path.join(output_dir, "disparity_decoder")
+                    )
+
+                    # Pop weights for all models
                     weights.pop()  # UNet
                     weights.pop()  # ControlNet
+                    weights.pop()  # DisparityEncoder
+                    weights.pop()  # DisparityDecoder
                 else:
-                    # Fallback to save only UNet if only one model
+                    # Fallback for backward compatibility
                     models[0].save_pretrained(os.path.join(output_dir, "unet"))
                     weights.pop()
 
@@ -660,8 +725,30 @@ def main():
                 # saved by accelerator.save_state() - no need to handle them manually here
 
         def load_model_hook(models, input_dir):
-            # Load both UNet and ControlNet
-            if len(models) >= 2:
+            # Load UNet, ControlNet, and disparity encoder/decoder
+            if len(models) >= 4:
+                # Pop and load DisparityDecoder (fourth model)
+                disparity_decoder_model = models.pop()
+                if os.path.exists(os.path.join(input_dir, "disparity_decoder")):
+                    load_disparity_decoder = DisparityDecoder.from_pretrained(
+                        input_dir, subfolder="disparity_decoder"
+                    )
+                    disparity_decoder_model.load_state_dict(
+                        load_disparity_decoder.state_dict()
+                    )
+                    del load_disparity_decoder
+
+                # Pop and load DisparityEncoder (third model)
+                disparity_encoder_model = models.pop()
+                if os.path.exists(os.path.join(input_dir, "disparity_encoder")):
+                    load_disparity_encoder = DisparityEncoder.from_pretrained(
+                        input_dir, subfolder="disparity_encoder"
+                    )
+                    disparity_encoder_model.load_state_dict(
+                        load_disparity_encoder.state_dict()
+                    )
+                    del load_disparity_encoder
+
                 # Pop and load ControlNet (second model)
                 controlnet_model = models.pop()
                 if os.path.exists(os.path.join(input_dir, "controlnet")):
@@ -678,7 +765,7 @@ def main():
                     unet_model.load_state_dict(load_unet.state_dict())
                     del load_unet
             else:
-                # Fallback to load only UNet if only one model
+                # Fallback for backward compatibility
                 unet_model = models.pop()
                 if os.path.exists(os.path.join(input_dir, "unet")):
                     load_unet = UNet2DConditionModel.from_pretrained(input_dir, subfolder="unet", in_channels=8)
@@ -695,6 +782,28 @@ def main():
     if args.gradient_checkpointing:
         unet.enable_gradient_checkpointing()
         controlnet.enable_gradient_checkpointing()
+        # Only enable gradient checkpointing if the models support it
+        if (
+            hasattr(disparity_encoder, "enable_gradient_checkpointing")
+            and hasattr(disparity_encoder, "_supports_gradient_checkpointing")
+            and disparity_encoder._supports_gradient_checkpointing
+        ):
+            disparity_encoder.enable_gradient_checkpointing()
+        else:
+            logger.warning(
+                "DisparityEncoder does not support gradient checkpointing, skipping."
+            )
+
+        if (
+            hasattr(disparity_decoder, "enable_gradient_checkpointing")
+            and hasattr(disparity_decoder, "_supports_gradient_checkpointing")
+            and disparity_decoder._supports_gradient_checkpointing
+        ):
+            disparity_decoder.enable_gradient_checkpointing()
+        else:
+            logger.warning(
+                "DisparityDecoder does not support gradient checkpointing, skipping."
+            )
 
     # Enable TF32 for faster training on Ampere GPUs,
     # cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
@@ -719,8 +828,13 @@ def main():
     else:
         optimizer_cls = torch.optim.AdamW
 
-    # Combine parameters from both UNet and ControlNet for training
-    trainable_params = list(unet.parameters()) + list(controlnet.parameters())
+    # Combine parameters from UNet, ControlNet, and disparity encoder/decoder for training
+    trainable_params = (
+        list(unet.parameters())
+        + list(controlnet.parameters())
+        + list(disparity_encoder.parameters())
+        + list(disparity_decoder.parameters())
+    )
 
     optimizer = optimizer_cls(
         trainable_params,
@@ -734,7 +848,7 @@ def main():
     # Use main_process_first to ensure dataset is loaded consistently across all processes
     with accelerator.main_process_first():
         dataset_cfg = OmegaConf.load(args.dataset_config_path)
-        train_dataset = build_dataset_from_cfg(dataset_cfg.data.train)
+        train_dataset = build_dataset_from_cfg(dataset_cfg.data.val)
 
         if args.max_train_samples is not None:
             raise NotImplementedError(
@@ -779,8 +893,22 @@ def main():
     )
 
     # Prepare everything with our `accelerator`.
-    unet, controlnet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        unet, controlnet, optimizer, train_dataloader, lr_scheduler
+    (
+        unet,
+        controlnet,
+        disparity_encoder,
+        disparity_decoder,
+        optimizer,
+        train_dataloader,
+        lr_scheduler,
+    ) = accelerator.prepare(
+        unet,
+        controlnet,
+        disparity_encoder,
+        disparity_decoder,
+        optimizer,
+        train_dataloader,
+        lr_scheduler,
     )
 
     # For mixed precision training we cast all non-trainable weights (vae, non-lora text_encoder and non-lora unet) to half-precision
@@ -794,7 +922,7 @@ def main():
         args.mixed_precision = accelerator.mixed_precision
 
     # Move text_encoder and vae to gpu and cast to weight_dtype
-    # Note: UNet and ControlNet are handled by accelerator.prepare() and should not be moved manually
+    # Note: UNet, ControlNet, and disparity encoder/decoder are handled by accelerator.prepare() and should not be moved manually
     text_encoder.to(accelerator.device, dtype=weight_dtype)
     vae.to(accelerator.device, dtype=weight_dtype)
 
@@ -895,66 +1023,85 @@ def main():
                 if args.train_batch_size != 1:
                     raise NotImplemented
                 with torch.no_grad():
-                    current_images = apply_augmentations_to_images(
-                        images=(batch[("pixel_values", 0)].squeeze() + 1) / 2,
-                        enable_augmentation=torch.rand(1).item() < 0.5,
-                        gaussian_noise_std=torch.rand(1).item() * 0.05,
-                    )
+                    current_features = vae.encode(batch[("pixel_values", 0)].squeeze().to(weight_dtype)).latent_dist.sample()
+                    current_features *= vae.config.scaling_factor
                     current_disparity_maps = (
-                        multiply_each_disparity_by_different_factors(
-                            (batch[("disparity_maps", 0)].squeeze() + 1) / 2,
-                        )
-                    )
+                        batch[("disparity_maps", 0)].squeeze() + 1
+                    ) / 2
 
-                    pixel_values_rendered = render_novel_views_using_point_cloud(
-                        current_features=current_images,
+                    novel_features = render_novel_views_using_point_cloud(
+                        current_features=current_features.float(),
                         current_depths=set_inf_to_max(
                             disparity2depth(current_disparity_maps)
                         ),
                         current_ego_mask=batch["ego_masks"].squeeze(),
-                        current_intrinsics=batch["intrinsics"].squeeze(),
+                        current_intrinsics=batch["latent_intrinsics"].squeeze(),
                         current_extrinsics=batch["extrinsics", 0].squeeze(),
-                        novel_intrinsics=batch["intrinsics"].squeeze(),
+                        novel_intrinsics=batch["latent_intrinsics"].squeeze(),
                         novel_extrinsics=batch["extrinsics", 1].squeeze(),
+                        point_radius=0.05,
+                        points_per_pixel=8,
                         current_objs_to_world=batch["objs_to_world", 0][0],
                         current_box_sizes=batch["box_sizes", 0][0],
                         current_obj_ids=batch["obj_ids", 0][0],
                         transforms_cur_to_next=batch["transforms", 0, 1][0],
-                        expanding_factor=1.0,
-                        image_size=(dataset_cfg.height, dataset_cfg.width),
+                        expanding_factor=1.5,
+                        image_size=(
+                            dataset_cfg.height // 8,
+                            dataset_cfg.width // 8,
+                        ),
+                        background_color=(0, 0, 0, 0),
                         return_novel_depths=False,
                     )["novel_features"]
-                    pixel_values_rendered = pixel_values_rendered.permute([0,3,1,2])  # [6, H, W, 3] -> [6, 3, H, W]
+                    novel_features = novel_features.permute(
+                        [0, 3, 1, 2]
+                    )  # [6, H, W, C] -> [6, C, H, W]
+
+                    # novel_features = novel_features.to(
+                    #     weight_dtype
+                    # )  # Convert back to weight_dtype
+                    # novel_images = vae.decode(
+                    #     novel_features / vae.config.scaling_factor,
+                    #     return_dict=False,
+                    # )[0]
+                    # novel_images = (novel_images / 2 + 0.5).clamp(0, 1)
+                    # concat_6_views(novel_images).save("novel_pred.png")
+                    # concat_6_views(
+                    #     batch[("pixel_values", 1)].squeeze() / 2 + 0.5
+                    # ).save("novel_gt.png")
                 pixel_values = batch[("pixel_values", 1)]  # Shape: [batch_size, 6, 3, H, W]
-                disparity_maps = batch[("disparity_maps", 1)].expand(
-                    -1, -1, 3, -1, -1
-                )  # Shape: [batch_size, 6, 3, H, W]
-                ego_masks = batch["ego_masks"]  # [batch_size, 6, 1, H, W]
-                box_disparity_maps = batch[("box_disparity_maps", 1)]  # Shape: [batch_size, 6, 1, H, W]
+                latent_disparity_maps = batch[
+                    ("disparity_maps", 1)
+                ]  # Shape: [batch_size, 6, 1, H//8, W//8]
+                ego_masks = batch["ego_masks"]  # [batch_size, 6, 1, H//8, W//8]
+                latent_box_disparity_maps = batch[("box_disparity_maps", 1)]  # Shape: [batch_size, 6, 1, H//8, W//8]
 
                 # Reshape from [batch_size, 6, ...] to [6*batch_size, ...] using view
                 pixel_values = pixel_values.view(
                     6 * args.train_batch_size, *pixel_values.shape[2:]
                 )  # [6*batch_size, 3, H, W]
-                disparity_maps = disparity_maps.view(
-                    6 * args.train_batch_size, *disparity_maps.shape[2:]
-                )  # [6*batch_size, 3, H, W]
+                latent_disparity_maps = latent_disparity_maps.view(
+                    6 * args.train_batch_size, *latent_disparity_maps.shape[2:]
+                )  # [6*batch_size, 1, H//8, W//8]
                 ego_masks = ego_masks.view(
                     6 * args.train_batch_size, *ego_masks.shape[2:]
                 )  # [6*batch_size, 1, H, W]
-                box_disparity_maps = box_disparity_maps.view(
-                    6 * args.train_batch_size, *box_disparity_maps.shape[2:]
-                )  # [6*batch_size, 1, H, W]
+                latent_box_disparity_maps = latent_box_disparity_maps.view(
+                    6 * args.train_batch_size, *latent_box_disparity_maps.shape[2:]
+                )  # [6*batch_size, 1, H//8, W//8]
+
                 # Convert images to latent space
                 rgb_latents = vae.encode(
                     torch.cat((pixel_values, pixel_values), dim=0).to(weight_dtype)
                     ).latent_dist.sample()
                 rgb_latents = rgb_latents * vae.config.scaling_factor
-                # Convert disparity to latent space
-                disparity_latents = vae.encode(
-                    torch.cat((disparity_maps, disparity_maps), dim=0).to(weight_dtype)
-                    ).latent_dist.sample()
-                disparity_latents = disparity_latents * vae.config.scaling_factor
+
+                # Encode disparity maps to latent space using disparity encoder
+                disparity_latents = disparity_encoder(
+                    torch.cat((latent_disparity_maps, latent_disparity_maps), dim=0).to(
+                        weight_dtype
+                    )
+                )
 
                 torch.cuda.empty_cache()
 
@@ -975,7 +1122,8 @@ def main():
                         (rgb_latents.shape[0], rgb_latents.shape[1], 1, 1), device=rgb_latents.device
                     )
                     disparity_noise += args.noise_offset * torch.randn(
-                        (disparity_latents.shape[0], disparity_latents.shape[1], 1, 1), device=disparity_latents.device
+                        (disparity_latents.shape[0], disparity_latents.shape[1], 1, 1),
+                        device=disparity_latents.device,
                     )
                 if args.input_perturbation:
                     new_rgb_noise = rgb_noise + args.input_perturbation * torch.randn_like(rgb_noise)
@@ -999,15 +1147,19 @@ def main():
                 # (this is the forward diffusion process)
                 if args.input_perturbation:
                     noisy_rgb_latents = noise_scheduler.add_noise(rgb_latents, new_rgb_noise, timesteps)
-                    noisy_disparity_latents = noise_scheduler.add_noise(disparity_latents, new_disparity_noise, timesteps)
+                    noisy_disparity_latents = noise_scheduler.add_noise(
+                        disparity_latents, new_disparity_noise, timesteps
+                    )
                 else:
                     noisy_rgb_latents = noise_scheduler.add_noise(rgb_latents, rgb_noise, timesteps)
-                    noisy_disparity_latents = noise_scheduler.add_noise(disparity_latents, disparity_noise, timesteps)
+                    noisy_disparity_latents = noise_scheduler.add_noise(
+                        disparity_latents, disparity_noise, timesteps
+                    )
 
                 # Concatenate rgb and depth
                 controlnet_cond = torch.cat(
-                    [pixel_values_rendered * 2 - 1, box_disparity_maps], dim=1
-                )  # [6*batch_size, 4, H, W]
+                    [novel_features, latent_box_disparity_maps], dim=1
+                )  # [6*batch_size, 5, H, W]
                 controlnet_cond = torch.cat([controlnet_cond, controlnet_cond], dim=0)
                 controlnet_cond = controlnet_cond.to(weight_dtype)
                 noisy_latents = torch.cat(
@@ -1023,7 +1175,9 @@ def main():
                     truncation=True,
                     return_tensors="pt",
                 )
-                text_input_ids = text_inputs.input_ids.to(disparity_latents.device)
+                text_input_ids = text_inputs.input_ids.to(
+                    noisy_disparity_latents.device
+                )
                 encoder_hidden_states = text_encoder(text_input_ids, return_dict=False)[0]
                 encoder_hidden_states = encoder_hidden_states.repeat(bsz, 1, 1)
 
@@ -1063,13 +1217,23 @@ def main():
                 )[0]
                 # Compute loss
                 rgb_loss = F.mse_loss(
-                    model_pred[:bsz_per_task][valid_mask].float(),
-                    rgb_latents[:bsz_per_task][valid_mask].float(),
+                    model_pred[:bsz_per_task].float(),
+                    rgb_latents[:bsz_per_task].float(),
                     reduction="mean",
                 )
+
+                # Decode predicted disparity latents and compute loss in disparity space
+                predicted_disparity_latents = model_pred[bsz_per_task:]
+                target_disparity_latents = latent_disparity_maps[:bsz_per_task]
+
+                predicted_disparity = disparity_decoder(predicted_disparity_latents)
+                target_disparity = disparity_decoder(target_disparity_latents)
+
                 disparity_loss = F.mse_loss(
-                    model_pred[bsz_per_task:][valid_mask].float(),
-                    disparity_latents[:bsz_per_task][valid_mask].float(),
+                    predicted_disparity[
+                        valid_mask[:, :1]
+                    ].float(),  # Use only first channel of valid_mask for disparity
+                    target_disparity[valid_mask[:, :1]].float(),
                     reduction="mean",
                 )
                 loss = disparity_loss + rgb_loss
@@ -1084,8 +1248,14 @@ def main():
                 # Backpropagate
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
-                    # Clip gradients for both UNet and ControlNet
-                    accelerator.clip_grad_norm_(list(unet.parameters()) + list(controlnet.parameters()), args.max_grad_norm)
+                    # Clip gradients for UNet, ControlNet, and disparity encoder/decoder
+                    accelerator.clip_grad_norm_(
+                        list(unet.parameters())
+                        + list(controlnet.parameters())
+                        + list(disparity_encoder.parameters())
+                        + list(disparity_decoder.parameters()),
+                        args.max_grad_norm,
+                    )
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
@@ -1150,6 +1320,8 @@ def main():
                             tokenizer,
                             unet,
                             controlnet,
+                            disparity_encoder,
+                            disparity_decoder,
                             args,
                             accelerator,
                             weight_dtype,
@@ -1165,6 +1337,8 @@ def main():
     if accelerator.is_main_process:
         unet = unwrap_model(unet)
         controlnet = unwrap_model(controlnet)
+        disparity_encoder = unwrap_model(disparity_encoder)
+        disparity_decoder = unwrap_model(disparity_decoder)
 
         pipeline = SDaIGControlNetPipeline.from_pretrained(
             args.pretrained_model_name_or_path,
@@ -1172,6 +1346,8 @@ def main():
             vae=vae,
             unet=unet,
             controlnet=controlnet,
+            disparity_encoder=disparity_encoder,
+            disparity_decoder=disparity_decoder,
             revision=args.revision,
             variant=args.variant,
         )

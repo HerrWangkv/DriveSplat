@@ -1,0 +1,62 @@
+name: NuScenes
+nuscenes_version: v1.0-mini
+dataroot: /data/raw/
+cache: /data/cache/
+scene_idx: 0
+height: 432
+width: 768
+interpolated_frame_between_keyframes: 4
+
+cameras:
+  - "CAM_FRONT_LEFT"
+  - "CAM_FRONT"
+  - "CAM_FRONT_RIGHT"
+  - "CAM_BACK_RIGHT"
+  - "CAM_BACK"
+  - "CAM_BACK_LEFT"
+
+data:
+  trainval:
+    type: SDaIGNuScenesTrainDataset
+    version: v1.0-trainval
+    dataroot: ${...dataroot}
+    cache_dir: ${...cache}
+    split: "trainval"
+    view_order: ${...cameras}
+    N: ${...interpolated_frame_between_keyframes}
+    height: ${...height}
+    width: ${...width}
+    use_latent: True
+  train:
+    type: SDaIGNuScenesTrainDataset
+    version: v1.0-trainval
+    dataroot: ${...dataroot}
+    cache_dir: ${...cache}
+    split: "train"
+    view_order: ${...cameras}
+    N: ${...interpolated_frame_between_keyframes}
+    height: ${...height}
+    width: ${...width}
+    use_latent: True
+  val:
+    type: SDaIGNuScenesTestDataset
+    version: v1.0-trainval
+    dataroot: ${...dataroot}
+    cache_dir: ${...cache}
+    split: "val"
+    view_order: ${...cameras}
+    N: ${...interpolated_frame_between_keyframes}
+    height: ${...height}
+    width: ${...width}
+    use_latent: True
+  inference:
+    type: SDaIGNuScenesTestDataset
+    version: v1.0-trainval
+    dataroot: ${...dataroot}
+    cache_dir: ${...cache}
+    split: 0
+    view_order: ${...cameras}
+    N: ${...interpolated_frame_between_keyframes}
+    height: ${...height}
+    width: ${...width}
+    use_latent: True

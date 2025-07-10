@@ -8,11 +8,11 @@ squashfuse /data/cache.sqfs /data/cache
 export MODEL_NAME="jingheya/lotus-depth-g-v2-1-disparity"
 
 # training dataset
-export DATASET_CONFIG="data/NuScenes/sdaig.yaml"
+export DATASET_CONFIG="data/NuScenes/latent_sdaig.yaml"
 
 # training configs
 export BATCH_SIZE=1
-export CUDA=01234567
+export CUDA=0
 export GAS=1
 export TOTAL_BSZ=$(($BATCH_SIZE * ${#CUDA} * $GAS))
 
@@ -22,10 +22,10 @@ export VAL_STEP=500
 export NUM_INFERENCE_STEPS=20  # Number of denoising steps during validation
 
 # output dir
-export OUTPUT_DIR="output/train-sdaig-bsz${TOTAL_BSZ}/"
+export OUTPUT_DIR="output/train-latent-sdaig-bsz${TOTAL_BSZ}/"
 
 accelerate launch --config_file=accelerate_configs/$CUDA.yaml --mixed_precision="fp16" \
-  train_sdaig.py \
+  train_latent_sdaig.py \
   --pretrained_model_name_or_path=$MODEL_NAME \
   --dataset_config_path=$DATASET_CONFIG \
   --dataloader_num_workers=0 \

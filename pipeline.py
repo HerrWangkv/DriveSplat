@@ -4,6 +4,7 @@ import PIL.Image
 import numpy as np
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from packaging import version
 from transformers import CLIPImageProcessor, CLIPTextModel, CLIPTokenizer, CLIPVisionModelWithProjection
@@ -12,7 +13,8 @@ from third_party.Lotus.utils.image_utils import resize_max_res, get_tv_resample_
 from torchvision.transforms.functional import resize
 from torchvision.transforms import InterpolationMode
 
-from diffusers.configuration_utils import FrozenDict
+from diffusers.configuration_utils import FrozenDict, ConfigMixin, register_to_config
+from diffusers.models.modeling_utils import ModelMixin
 from diffusers.image_processor import PipelineImageInput, VaeImageProcessor
 from diffusers.loaders import FromSingleFileMixin, IPAdapterMixin, LoraLoaderMixin, TextualInversionLoaderMixin
 from diffusers.models import (
@@ -40,7 +42,7 @@ from diffusers.pipelines.pipeline_utils import DiffusionPipeline, StableDiffusio
 from diffusers.pipelines.stable_diffusion.pipeline_output import StableDiffusionPipelineOutput
 from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
 from diffusers.pipelines.controlnet.multicontrolnet import MultiControlNetModel
-from diffusers import StableDiffusionPipeline
+
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -103,6 +105,42 @@ def retrieve_timesteps(
     return timesteps, num_inference_steps
 
 
+class DisparityEncoder(ModelMixin, ConfigMixin):
+    _supports_gradient_checkpointing = (
+        False  # Single layer model doesn't need checkpointing
+    )
+
+    @register_to_config
+    def __init__(self, in_channels=1, out_channels=4):
+        super(DisparityEncoder, self).__init__()
+        self.conv = nn.Conv2d(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=1,
+        )
+
+    def forward(self, x):
+        return self.conv(x)
+
+
+class DisparityDecoder(ModelMixin, ConfigMixin):
+    _supports_gradient_checkpointing = (
+        False  # Single layer model doesn't need checkpointing
+    )
+
+    @register_to_config
+    def __init__(self, in_channels=4, out_channels=1):
+        super(DisparityDecoder, self).__init__()
+        self.conv = nn.Conv2d(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=1,
+        )
+
+    def forward(self, x):
+        return self.conv(x)
+
+
 class DirectDiffusionControlNetPipeline(
     DiffusionPipeline,
     StableDiffusionMixin,
@@ -154,6 +192,8 @@ class DirectDiffusionControlNetPipeline(
         "feature_extractor",
         "image_encoder",
         "controlnet",
+        "disparity_encoder",
+        "disparity_decoder",
     ]
     _exclude_from_cpu_offload = ["safety_checker"]
     _callback_tensor_inputs = ["latents", "prompt_embeds", "negative_prompt_embeds"]
@@ -174,6 +214,8 @@ class DirectDiffusionControlNetPipeline(
         safety_checker: StableDiffusionSafetyChecker,
         feature_extractor: CLIPImageProcessor,
         image_encoder: CLIPVisionModelWithProjection = None,
+        disparity_encoder: DisparityEncoder = None,
+        disparity_decoder: DisparityDecoder = None,
         requires_safety_checker: bool = True,
     ):
         super().__init__()
@@ -255,6 +297,8 @@ class DirectDiffusionControlNetPipeline(
             safety_checker=safety_checker,
             feature_extractor=feature_extractor,
             image_encoder=image_encoder,
+            disparity_encoder=disparity_encoder,
+            disparity_decoder=disparity_decoder,
         )
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
@@ -500,6 +544,24 @@ class DirectDiffusionControlNetPipeline(
             uncond_image_embeds = torch.zeros_like(image_embeds)
 
             return image_embeds, uncond_image_embeds
+
+    def encode_disparity(self, disparity, device):
+        if self.disparity_encoder is None:
+            return disparity
+        dtype = next(self.disparity_encoder.parameters()).dtype
+        if not isinstance(disparity, torch.Tensor):
+            disparity = torch.tensor(disparity, dtype=dtype)
+        disparity = disparity.to(device=device, dtype=dtype)
+        return self.disparity_encoder(disparity)
+
+    def decode_disparity(self, disparity, device):
+        if self.disparity_decoder is None:
+            return disparity
+        dtype = next(self.disparity_decoder.parameters()).dtype
+        if not isinstance(disparity, torch.Tensor):
+            disparity = torch.tensor(disparity, dtype=dtype)
+        disparity = disparity.to(device=device, dtype=dtype)
+        return self.disparity_decoder(disparity)
 
     def prepare_ip_adapter_image_embeds(
         self, ip_adapter_image, ip_adapter_image_embeds, device, num_images_per_prompt, do_classifier_free_guidance
@@ -1507,9 +1569,9 @@ class SDaIGControlNetPipeline(DirectDiffusionControlNetPipeline):
             4 == disparity_cond.dim() and 1 == disparity_cond_size[-3]
         ), f"Wrong input shape {disparity_cond_size}, expected [B, 3, H, W]"
         rgb_cond_size = rgb_cond.shape
-        assert (
-            4 == rgb_cond.dim() and 3 == rgb_cond_size[-3]
-        ), f"Wrong input shape {rgb_cond_size}, expected [B, 3, H, W]"
+        assert 4 == rgb_cond.dim() and (
+            3 == rgb_cond_size[-3] or 4 == rgb_cond_size[-3]
+        ), f"Wrong input shape {rgb_cond_size}, expected [B, 3, H, W] or [B, 4, H, W]"
 
         # Resize image
         # 1. Default height and width to unet
@@ -1568,6 +1630,7 @@ class SDaIGControlNetPipeline(DirectDiffusionControlNetPipeline):
         assert (
             disparity_cond.shape[2:] == rgb_cond.shape[2:]
         ), f"Condition images must have the same spatial dimensions, got {disparity_cond.shape[2:]} and {rgb_cond.shape[2:]}"
+        disparity_cond = self.encode_disparity(disparity_cond, device)
         controlnet_cond = torch.cat([rgb_cond, disparity_cond], dim=1)
         # 5. Prepare timesteps
         timesteps, num_inference_steps = retrieve_timesteps(
@@ -1700,11 +1763,24 @@ class SDaIGControlNetPipeline(DirectDiffusionControlNetPipeline):
         if len(timesteps) > 1:
             latents = torch.cat([latents[:, :4], latents[:, 4:]], dim=0)
         if not output_type == "latent":
-            image = self.vae.decode(
-                latents / self.vae.config.scaling_factor,
-                return_dict=False,
-                generator=generator,
-            )[0]
+            if self.disparity_decoder is not None:
+                image_latents = latents[: len(latents) // 2]
+                latent_disparities = latents[len(latents) // 2 :]
+                image = self.vae.decode(
+                    image_latents / self.vae.config.scaling_factor,
+                    return_dict=False,
+                    generator=generator,
+                )[0]
+                disparity = self.decode_disparity(latent_disparities, device).expand(
+                    -1, 3, -1, -1
+                )
+                image = torch.cat([image, disparity], dim=0)
+            else:
+                image = self.vae.decode(
+                    latents / self.vae.config.scaling_factor,
+                    return_dict=False,
+                    generator=generator,
+                )[0]
             torch.cuda.empty_cache()
             image, has_nsfw_concept = self.run_safety_checker(
                 image, device, prompt_embeds.dtype
