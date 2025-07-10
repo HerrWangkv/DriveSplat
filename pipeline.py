@@ -106,38 +106,72 @@ def retrieve_timesteps(
 
 
 class DisparityEncoder(ModelMixin, ConfigMixin):
-    _supports_gradient_checkpointing = (
-        False  # Single layer model doesn't need checkpointing
-    )
+    """
+    Simple learned projection from disparity maps to latent space.
+    Handles range normalization and channel projection.
+    """
+    _supports_gradient_checkpointing = False
 
     @register_to_config
     def __init__(self, in_channels=1, out_channels=4):
         super(DisparityEncoder, self).__init__()
+
+        # Simple 1x1 conv projection with learnable scaling
         self.conv = nn.Conv2d(
-            in_channels=in_channels,
-            out_channels=out_channels,
-            kernel_size=1,
+            in_channels=in_channels, out_channels=out_channels, kernel_size=1, bias=True
         )
 
+        # Initialize to a reasonable scale for disparity-to-latent conversion
+        # Start with identity-like mapping for the first channel
+        with torch.no_grad():
+            # Initialize first output channel to pass through input with some scaling
+            self.conv.weight[0, 0] = (
+                4.0  # Scale disparity [-1,1] to latent range [-4,4]
+            )
+            # Initialize other channels to zero (will be learned)
+            self.conv.weight[1:, 0] = 0.0
+            # Small bias initialization
+            self.conv.bias.fill_(0.0)
+
     def forward(self, x):
+        """
+        Project disparity maps to latent space.
+        Input: disparity in range [-1, 1]
+        Output: projected to 4 channels with appropriate range for concatenation with VAE latents
+        """
         return self.conv(x)
 
 
 class DisparityDecoder(ModelMixin, ConfigMixin):
-    _supports_gradient_checkpointing = (
-        False  # Single layer model doesn't need checkpointing
-    )
+    """
+    Simple learned projection from latent space back to disparity maps.
+    """
+    _supports_gradient_checkpointing = False
 
     @register_to_config
     def __init__(self, in_channels=4, out_channels=1):
         super(DisparityDecoder, self).__init__()
+
+        # Simple 1x1 conv projection with learnable scaling
         self.conv = nn.Conv2d(
-            in_channels=in_channels,
-            out_channels=out_channels,
-            kernel_size=1,
+            in_channels=in_channels, out_channels=out_channels, kernel_size=1, bias=True
         )
 
+        # Initialize to primarily use the first channel (which should contain disparity)
+        with torch.no_grad():
+            # Initialize to primarily use first channel
+            self.conv.weight[0, 0] = 0.25  # Inverse of encoder scaling (1/4)
+            self.conv.weight[0, 1:] = (
+                0.0  # Start with other channels having no contribution
+            )
+            self.conv.bias.fill_(0.0)
+
     def forward(self, x):
+        """
+        Project latent space back to disparity maps.
+        Input: 4-channel latents
+        Output: disparity in range approximately [-1, 1]
+        """
         return self.conv(x)
 
 
@@ -1567,7 +1601,7 @@ class SDaIGControlNetPipeline(DirectDiffusionControlNetPipeline):
         disparity_cond_size = disparity_cond.shape
         assert (
             4 == disparity_cond.dim() and 1 == disparity_cond_size[-3]
-        ), f"Wrong input shape {disparity_cond_size}, expected [B, 3, H, W]"
+        ), f"Wrong input shape {disparity_cond_size}, expected [B, 1, H, W]"
         rgb_cond_size = rgb_cond.shape
         assert 4 == rgb_cond.dim() and (
             3 == rgb_cond_size[-3] or 4 == rgb_cond_size[-3]

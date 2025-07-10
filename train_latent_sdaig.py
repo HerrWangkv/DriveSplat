@@ -106,7 +106,9 @@ def run_example_validation(pipeline, batch, args, step, generator, weight_dtype)
         background_color=(0, 0, 0, 0),
         return_novel_depths=False,
     )["novel_features"]
-    novel_features = novel_features.permute([0,3,1,2])  # [6, H, W, 3] -> [6, 3, H, W]
+    novel_features = novel_features.permute(
+        [0, 3, 1, 2]
+    )  # [6, H, W, C] -> [6, C, H, W]
     novel_features = novel_features.to(weight_dtype)
     novel_images = pipeline.vae.decode(
         novel_features / pipeline.vae.config.scaling_factor, return_dict=False
@@ -161,8 +163,21 @@ def run_example_validation(pipeline, batch, args, step, generator, weight_dtype)
                 output_type="latent",
                 timesteps=[args.timestep],
             ).images
-        rgb_latents = preds[: len(preds) // 2]  # [B, 3, H//8, W//8]
-        latent_disparities = preds[len(preds) // 2 :]  # [B, 1, H//8, W//8]
+        rgb_latents = preds[: len(preds) // 2]  # [B, 4, H//8, W//8]
+        latent_disparities = preds[len(preds) // 2 :]  # [B, 4, H//8, W//8]
+
+        # Debug: Print shapes and some statistics
+        print(f"VALIDATION DEBUG:")
+        print(f"  preds.shape = {preds.shape}")
+        print(f"  rgb_latents.shape = {rgb_latents.shape}")
+        print(f"  latent_disparities.shape = {latent_disparities.shape}")
+        print(
+            f"  rgb_latents stats: min={rgb_latents.min():.4f}, max={rgb_latents.max():.4f}, mean={rgb_latents.mean():.4f}"
+        )
+        print(
+            f"  latent_disparities stats: min={latent_disparities.min():.4f}, max={latent_disparities.max():.4f}, mean={latent_disparities.mean():.4f}"
+        )
+
         rgb_out = pipeline.vae.decode(
             rgb_latents / pipeline.vae.config.scaling_factor,
             return_dict=False,
@@ -173,7 +188,38 @@ def run_example_validation(pipeline, batch, args, step, generator, weight_dtype)
         disparity_out = pipeline.decode_disparity(
             latent_disparities, pipeline.device
         )  # [B, 1, H//8, W//8]
+        print(
+            f"  disparity_out (before norm) stats: min={disparity_out.min():.4f}, max={disparity_out.max():.4f}, mean={disparity_out.mean():.4f}"
+        )
+
         disparity_out = (disparity_out / 2 + 0.5).clamp(0, 1)  # Normalize to [0, 1]
+        print(
+            f"  disparity_out (after norm) stats: min={disparity_out.min():.4f}, max={disparity_out.max():.4f}, mean={disparity_out.mean():.4f}"
+        )
+
+        # Debug: Compare with ground truth disparity
+        disparity_gt_tensor = (batch["disparity_maps", 1][0] + 1) / 2
+        print(
+            f"  disparity_gt stats: min={disparity_gt_tensor.min():.4f}, max={disparity_gt_tensor.max():.4f}, mean={disparity_gt_tensor.mean():.4f}"
+        )
+
+        # Debug: Test encoder-decoder round trip on ground truth
+        gt_encoded = pipeline.encode_disparity(disparity_gt_tensor, pipeline.device)
+        gt_decoded = pipeline.decode_disparity(gt_encoded, pipeline.device)
+        gt_decoded_norm = (gt_decoded / 2 + 0.5).clamp(0, 1)
+        print(f"  GT encode-decode test:")
+        print(
+            f"    GT original: min={disparity_gt_tensor.min():.4f}, max={disparity_gt_tensor.max():.4f}, mean={disparity_gt_tensor.mean():.4f}"
+        )
+        print(
+            f"    GT encoded: min={gt_encoded.min():.4f}, max={gt_encoded.max():.4f}, mean={gt_encoded.mean():.4f}"
+        )
+        print(
+            f"    GT decoded: min={gt_decoded_norm.min():.4f}, max={gt_decoded_norm.max():.4f}, mean={gt_decoded_norm.mean():.4f}"
+        )
+        print(
+            f"    Round-trip MSE: {F.mse_loss(gt_decoded_norm, disparity_gt_tensor):.6f}"
+        )
 
         depth_out = set_inf_to_max(disparity2depth(disparity_out))
         concat_and_visualize_6_depths(
@@ -1037,6 +1083,7 @@ def main():
 
         train_loss = 0.0
         log_disparity_loss = 0.0
+        log_reconstruction_loss = 0.0
         log_rgb_loss = 0.0
 
         for _ in range(len(train_dataloader)):
@@ -1251,19 +1298,63 @@ def main():
                 predicted_disparity = disparity_decoder(predicted_disparity_latents)
                 target_disparity = latent_disparity_maps
 
+                # Compute disparity loss
                 disparity_loss = F.mse_loss(
                     predicted_disparity[valid_mask].float(),
                     target_disparity[valid_mask].float(),
                     reduction="mean",
                 )
-                loss = disparity_loss + rgb_loss
+
+                # Add reconstruction loss to train encoder-decoder mapping
+                # This ensures the encoder-decoder learns to preserve disparity information
+                target_encoded = disparity_encoder(target_disparity)
+                target_reconstructed = disparity_decoder(target_encoded)
+                reconstruction_loss = F.mse_loss(
+                    target_reconstructed[valid_mask].float(),
+                    target_disparity[valid_mask].float(),
+                    reduction="mean",
+                )
+
+                total_disparity_loss = disparity_loss + reconstruction_loss
+
+                # Debug: Print training statistics occasionally
+                if global_step % 100 == 0:
+                    print(f"TRAINING DEBUG (step {global_step}):")
+                    print(
+                        f"  predicted_disparity_latents stats: min={predicted_disparity_latents.min():.4f}, max={predicted_disparity_latents.max():.4f}, mean={predicted_disparity_latents.mean():.4f}"
+                    )
+                    print(
+                        f"  predicted_disparity stats: min={predicted_disparity.min():.4f}, max={predicted_disparity.max():.4f}, mean={predicted_disparity.mean():.4f}"
+                    )
+                    print(
+                        f"  target_disparity stats: min={target_disparity.min():.4f}, max={target_disparity.max():.4f}, mean={target_disparity.mean():.4f}"
+                    )
+                    print(
+                        f"  target_reconstructed stats: min={target_reconstructed.min():.4f}, max={target_reconstructed.max():.4f}, mean={target_reconstructed.mean():.4f}"
+                    )
+                    print(f"  valid_mask sum: {valid_mask.sum()}")
+                    print(f"  disparity_loss: {disparity_loss:.6f}")
+                    print(f"  reconstruction_loss: {reconstruction_loss:.6f}")
+                    print(f"  total_disparity_loss: {total_disparity_loss:.6f}")
+                    print(f"  rgb_loss: {rgb_loss:.6f}")
+
+                    # Test encoder-decoder round trip on target disparity (should be very similar to reconstruction loss)
+                    round_trip_mse = F.mse_loss(target_reconstructed, target_disparity)
+                    print(f"  Encoder-decoder round-trip MSE: {round_trip_mse:.6f}")
+                loss = total_disparity_loss + rgb_loss
 
                 # Gather loss
                 avg_disparity_loss = accelerator.gather(disparity_loss.repeat(args.train_batch_size*6)).mean()
                 log_disparity_loss += avg_disparity_loss.item() / args.gradient_accumulation_steps
+                avg_reconstruction_loss = accelerator.gather(
+                    reconstruction_loss.repeat(args.train_batch_size * 6)
+                ).mean()
+                log_reconstruction_loss += (
+                    avg_reconstruction_loss.item() / args.gradient_accumulation_steps
+                )
                 avg_rgb_loss = accelerator.gather(rgb_loss.repeat(args.train_batch_size*6)).mean()
                 log_rgb_loss += avg_rgb_loss.item() / args.gradient_accumulation_steps
-                train_loss = log_disparity_loss + log_rgb_loss
+                train_loss = log_disparity_loss + log_reconstruction_loss + log_rgb_loss
 
                 # Backpropagate
                 accelerator.backward(loss)
@@ -1284,22 +1375,31 @@ def main():
                 if global_step % 50 == 0:  # Clear cache every 50 steps
                     torch.cuda.empty_cache()
 
-            logs = {"SL": loss.detach().item(), 
-                    "SL_D": disparity_loss.detach().item(), 
-                    "SL_R": rgb_loss.detach().item(), 
-                    "lr": lr_scheduler.get_last_lr()[0]}
+            logs = {
+                "SL": loss.detach().item(),
+                "SL_D": disparity_loss.detach().item(),
+                "SL_RC": reconstruction_loss.detach().item(),
+                "SL_R": rgb_loss.detach().item(),
+                "lr": lr_scheduler.get_last_lr()[0],
+            }
             progress_bar.set_postfix(**logs)
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 global_step += 1
-                accelerator.log({"train_loss": train_loss,
-                                "disparity_loss": log_disparity_loss,
-                                "rgb_loss": log_rgb_loss},
-                                 step=global_step)
+                accelerator.log(
+                    {
+                        "train_loss": train_loss,
+                        "disparity_loss": log_disparity_loss,
+                        "reconstruction_loss": log_reconstruction_loss,
+                        "rgb_loss": log_rgb_loss,
+                    },
+                    step=global_step,
+                )
                 train_loss = 0.0
                 log_disparity_loss = 0.0
+                log_reconstruction_loss = 0.0
                 log_rgb_loss = 0.0
 
                 checkpointing_steps = args.checkpointing_steps
