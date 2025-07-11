@@ -86,11 +86,17 @@ def depth2disparity(depth, return_mask=False):
 
 def disparity2depth(disparity, return_mask=False):
     if isinstance(disparity, torch.Tensor):
-        depth = torch.ones_like(disparity) * float("inf")
+        depth = torch.ones_like(disparity, dtype=disparity.dtype) * float("inf")
     elif isinstance(disparity, np.ndarray):
         depth = np.ones_like(disparity) * float("inf")
     non_negtive_mask = disparity > 0
-    depth[non_negtive_mask] = 1.0 / disparity[non_negtive_mask]
+    # Ensure dtype consistency for the division operation
+    if isinstance(disparity, torch.Tensor):
+        depth[non_negtive_mask] = (1.0 / disparity[non_negtive_mask]).to(
+            disparity.dtype
+        )
+    else:
+        depth[non_negtive_mask] = 1.0 / disparity[non_negtive_mask]
     if return_mask:
         return depth, non_negtive_mask
     else:

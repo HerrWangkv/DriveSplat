@@ -164,18 +164,18 @@ def run_example_validation(pipeline, batch, args, step, generator, weight_dtype)
                 timesteps=[args.timestep],
             ).images
         rgb_latents = preds[: len(preds) // 2]  # [B, 4, H//8, W//8]
-        latent_disparities = preds[len(preds) // 2 :]  # [B, 4, H//8, W//8]
+        disparity_latents = preds[len(preds) // 2 :]  # [B, 4, H//8, W//8]
 
         # Debug: Print shapes and some statistics
         print(f"VALIDATION DEBUG:")
-        print(f"  preds.shape = {preds.shape}")
-        print(f"  rgb_latents.shape = {rgb_latents.shape}")
-        print(f"  latent_disparities.shape = {latent_disparities.shape}")
+        # print(f"  preds.shape = {preds.shape}")
+        # print(f"  rgb_latents.shape = {rgb_latents.shape}")
+        # print(f"  disparity_latents.shape = {disparity_latents.shape}")
         print(
             f"  rgb_latents stats: min={rgb_latents.min():.4f}, max={rgb_latents.max():.4f}, mean={rgb_latents.mean():.4f}"
         )
         print(
-            f"  latent_disparities stats: min={latent_disparities.min():.4f}, max={latent_disparities.max():.4f}, mean={latent_disparities.mean():.4f}"
+            f"  disparity_latents stats: min={disparity_latents.min():.4f}, max={disparity_latents.max():.4f}, mean={disparity_latents.mean():.4f}"
         )
 
         rgb_out = pipeline.vae.decode(
@@ -186,7 +186,7 @@ def run_example_validation(pipeline, batch, args, step, generator, weight_dtype)
         rgb_out = (rgb_out / 2 + 0.5).clamp(0, 1)  # Normalize to [0, 1]
 
         disparity_out = pipeline.decode_disparity(
-            latent_disparities, pipeline.device
+            disparity_latents, pipeline.device
         )  # [B, 1, H//8, W//8]
         print(
             f"  disparity_out (before norm) stats: min={disparity_out.min():.4f}, max={disparity_out.max():.4f}, mean={disparity_out.mean():.4f}, std={disparity_out.std():.4f}"
@@ -217,9 +217,6 @@ def run_example_validation(pipeline, batch, args, step, generator, weight_dtype)
 
         # Debug: Compare with ground truth disparity
         disparity_gt_tensor = batch["disparity_maps", 1][0]
-        print(
-            f"  disparity_gt stats: min={disparity_gt_tensor.min():.4f}, max={disparity_gt_tensor.max():.4f}, mean={disparity_gt_tensor.mean():.4f}"
-        )
 
         # Debug: Test encoder-decoder round trip on ground truth
         gt_encoded = pipeline.encode_disparity(disparity_gt_tensor, pipeline.device)
@@ -238,37 +235,6 @@ def run_example_validation(pipeline, batch, args, step, generator, weight_dtype)
         print(
             f"    Round-trip MSE: {F.mse_loss(gt_decoded_norm, disparity_gt_tensor):.6f}"
         )
-
-        # CRITICAL: Check if the validation normalization is correct
-        # The disparity_gt_tensor is in range [-1, 1], so decoder should also output [-1, 1]
-        print(f"  CRITICAL DEBUG:")
-        print(f"    Expected disparity range: [-1, 1] (from batch data)")
-        print(
-            f"    Decoder output range: [{disparity_out.min():.4f}, {disparity_out.max():.4f}]"
-        )
-        print(
-            f"    After /2+0.5 norm: [{(disparity_out/2+0.5).min():.4f}, {(disparity_out/2+0.5).max():.4f}]"
-        )
-
-        # Check if decoder is working correctly by testing on known input
-        test_input = (
-            torch.tensor([-1.0, 0.0, 1.0])
-            .reshape(1, 1, 1, 3)
-            .to(disparity_gt_tensor.device)
-            .to(disparity_gt_tensor.dtype)
-        )
-        test_encoded = pipeline.encode_disparity(test_input, pipeline.device)
-        test_decoded = pipeline.decode_disparity(test_encoded, pipeline.device)
-        print(
-            f"    Decoder test: input=[-1,0,1] -> encoded=[{test_encoded.min():.2f},{test_encoded.max():.2f}] -> decoded=[{test_decoded.min():.2f},{test_decoded.max():.2f}]"
-        )
-
-        # Check if decoder output range is reasonable for [-1,1] input
-        if disparity_out.min() >= -1.1 and disparity_out.max() <= 1.1:
-            print(f"    ✓ Decoder output range is reasonable for [-1,1] target")
-        else:
-            print(f"    ✗ Decoder output range is NOT reasonable for [-1,1] target")
-            print(f"    ✗ This will cause incorrect normalization with /2+0.5")
 
         depth_out = set_inf_to_max(disparity2depth(disparity_out))
         concat_and_visualize_6_depths(
@@ -1190,10 +1156,10 @@ def main():
                 valid_mask = ~ego_masks
 
                 # Debug: Check valid mask dimensions and coverage
-                print(f"DEBUG: ego_masks shape: {ego_masks.shape}")
-                print(f"DEBUG: valid_mask shape: {valid_mask.shape}")
-                print(f"DEBUG: disparity_latents shape: {disparity_latents.shape}")
-                print(f"DEBUG: valid_mask coverage: {valid_mask.float().mean():.4f}")
+                # print(f"DEBUG: ego_masks shape: {ego_masks.shape}")
+                # print(f"DEBUG: valid_mask shape: {valid_mask.shape}")
+                # print(f"DEBUG: disparity_latents shape: {disparity_latents.shape}")
+                # print(f"DEBUG: valid_mask coverage: {valid_mask.float().mean():.4f}")
 
                 # Ensure valid_mask is properly sized for latent space
                 if valid_mask.shape[-2:] != disparity_latents.shape[-2:]:
@@ -1344,13 +1310,13 @@ def main():
                     valid_mask.expand(-1, 4, -1, -1)
                 ].float()
 
-                print(
-                    f"DEBUG: Valid region stats - pred: min={pred_valid.min():.4f}, max={pred_valid.max():.4f}, mean={pred_valid.mean():.4f}, std={pred_valid.std():.4f}"
-                )
-                print(
-                    f"DEBUG: Valid region stats - target: min={target_valid.min():.4f}, max={target_valid.max():.4f}, mean={target_valid.mean():.4f}, std={target_valid.std():.4f}"
-                )
-                print(f"DEBUG: Valid region size: {len(pred_valid)} elements")
+                # print(
+                #     f"DEBUG: Valid region stats - pred: min={pred_valid.min():.4f}, max={pred_valid.max():.4f}, mean={pred_valid.mean():.4f}, std={pred_valid.std():.4f}"
+                # )
+                # print(
+                #     f"DEBUG: Valid region stats - target: min={target_valid.min():.4f}, max={target_valid.max():.4f}, mean={target_valid.mean():.4f}, std={target_valid.std():.4f}"
+                # )
+                # print(f"DEBUG: Valid region size: {len(pred_valid)} elements")
 
                 disparity_loss = F.mse_loss(pred_valid, target_valid, reduction="mean")
 
@@ -1358,17 +1324,25 @@ def main():
                 # This ensures the encoder-decoder learns to preserve disparity information
                 # and regularizes the latent space with KL divergence
 
-                # Compute VAE loss using the disparity VAE model
+                # Compute VAE loss using the disparity VAE model with warmup
+                # VAE warmup: gradually increase KL weight to prevent collapse
+                warmup_steps = 1000
+                kl_weight = (
+                    min(0.001, 0.001 * (global_step / warmup_steps))
+                    if global_step < warmup_steps
+                    else 0.001
+                )
+
                 vae_loss, vae_reconstruction_loss, kl_loss, target_reconstructed = (
                     disparity_vae_module.compute_vae_loss(
                         latent_disparity_maps,
-                        beta=0.1,  # Small beta to not overwhelm other losses
+                        beta=kl_weight,  # Use dynamic KL weight
                     )
                 )
 
                 total_disparity_loss = (
-                    disparity_loss + 0.1 * vae_loss
-                )  # Reduce VAE weight
+                    disparity_loss + 0.01 * vae_loss
+                )  # Further reduce VAE weight
 
                 # The variance regularization is now handled by the KL divergence in the VAE
                 # No need for manual variance penalty anymore
@@ -1380,6 +1354,7 @@ def main():
                         f"  predicted_disparity_latents stats: min={predicted_disparity_latents.min():.4f}, max={predicted_disparity_latents.max():.4f}, mean={predicted_disparity_latents.mean():.4f}"
                     )
                     print(f"  valid_mask sum: {valid_mask.sum()}")
+                    print(f"  kl_weight: {kl_weight:.6f}")
                     print(f"  disparity_loss: {disparity_loss:.6f}")
                     print(f"  vae_reconstruction_loss: {vae_reconstruction_loss:.6f}")
                     print(f"  kl_loss: {kl_loss:.6f}")

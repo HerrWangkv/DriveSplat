@@ -114,9 +114,9 @@ class DisparityVAE(ModelMixin, ConfigMixin):
     @register_to_config
     def __init__(self, in_channels=1, latent_channels=4, hidden_channels=64):
         super(DisparityVAE, self).__init__()
-        
+
         self.latent_channels = latent_channels
-        
+
         # Encoder network
         self.encoder = nn.Sequential(
             # Initial conv to increase channels
@@ -127,26 +127,27 @@ class DisparityVAE(ModelMixin, ConfigMixin):
             nn.Conv2d(hidden_channels // 2, hidden_channels, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
         )
-        
+
         # Split into mean and log variance
         self.mu_head = nn.Conv2d(hidden_channels, latent_channels, kernel_size=1)
         self.logvar_head = nn.Conv2d(hidden_channels, latent_channels, kernel_size=1)
-        
+
         # Decoder network
         self.decoder = nn.Sequential(
             nn.Conv2d(latent_channels, hidden_channels, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(hidden_channels, hidden_channels // 2, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(hidden_channels // 2, hidden_channels // 4, kernel_size=3, padding=1),
+            nn.Conv2d(
+                hidden_channels // 2, hidden_channels // 4, kernel_size=3, padding=1
+            ),
             nn.ReLU(inplace=True),
             nn.Conv2d(hidden_channels // 4, in_channels, kernel_size=3, padding=1),
-            nn.Tanh()  # Output in [-1, 1] range
         )
-        
+
         # Initialize weights
         self._init_weights()
-    
+
     def _init_weights(self):
         """Initialize weights with appropriate scaling."""
         for m in self.modules():
@@ -154,11 +155,11 @@ class DisparityVAE(ModelMixin, ConfigMixin):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
-        
+
         # Initialize logvar head to small negative values (small initial variance)
         nn.init.constant_(self.logvar_head.weight, 0)
         nn.init.constant_(self.logvar_head.bias, -2.0)
-    
+
     def encode(self, x):
         """
         Encode input to latent parameters.
@@ -168,7 +169,7 @@ class DisparityVAE(ModelMixin, ConfigMixin):
         mu = self.mu_head(h)
         logvar = self.logvar_head(h)
         return mu, logvar
-    
+
     def reparameterize(self, mu, logvar):
         """
         Reparameterization trick for sampling from latent distribution.
@@ -176,13 +177,13 @@ class DisparityVAE(ModelMixin, ConfigMixin):
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
         return mu + eps * std
-    
+
     def decode(self, z):
         """
         Decode latent representation back to disparity.
         """
         return self.decoder(z)
-    
+
     def forward(self, x, return_distribution=False):
         """
         Full forward pass through VAE.
@@ -194,13 +195,13 @@ class DisparityVAE(ModelMixin, ConfigMixin):
         """
         mu, logvar = self.encode(x)
         z = self.reparameterize(mu, logvar)
-        
+
         if return_distribution:
             reconstruction = self.decode(z)
             return z, mu, logvar, reconstruction
         else:
             return z
-    
+
     def compute_vae_loss(self, x, beta=1.0):
         """
         Compute VAE loss including reconstruction and KL divergence.
@@ -213,21 +214,17 @@ class DisparityVAE(ModelMixin, ConfigMixin):
             total_loss, reconstruction_loss, kl_loss, reconstruction
         """
         z, mu, logvar, reconstruction = self.forward(x, return_distribution=True)
-        
+
         # Reconstruction loss
         reconstruction_loss = F.mse_loss(reconstruction, x, reduction='mean')
-        
-        # KL divergence loss
-        kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=[1, 2, 3])
-        kl_loss = kl_loss.mean()
-        
+
+        # KL divergence loss - compute mean over all dimensions to get per-pixel KL
+        kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+
         # Total loss
         total_loss = reconstruction_loss + beta * kl_loss
-        
+
         return total_loss, reconstruction_loss, kl_loss, reconstruction
-
-
-
 
 
 class DirectDiffusionControlNetPipeline(
