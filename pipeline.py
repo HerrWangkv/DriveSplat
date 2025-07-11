@@ -105,74 +105,129 @@ def retrieve_timesteps(
     return timesteps, num_inference_steps
 
 
-class DisparityEncoder(ModelMixin, ConfigMixin):
+class DisparityVAE(ModelMixin, ConfigMixin):
     """
-    Simple learned projection from disparity maps to latent space.
-    Handles range normalization and channel projection.
-    """
-    _supports_gradient_checkpointing = False
-
-    @register_to_config
-    def __init__(self, in_channels=1, out_channels=4):
-        super(DisparityEncoder, self).__init__()
-
-        # Simple 1x1 conv projection with learnable scaling
-        self.conv = nn.Conv2d(
-            in_channels=in_channels, out_channels=out_channels, kernel_size=1, bias=True
-        )
-
-        # Initialize to a reasonable scale for disparity-to-latent conversion
-        # Start with identity-like mapping for the first channel
-        with torch.no_grad():
-            # Initialize first output channel to pass through input with some scaling
-            self.conv.weight[0, 0] = (
-                4.0  # Scale disparity [-1,1] to latent range [-4,4]
-            )
-            # Initialize other channels to zero (will be learned)
-            self.conv.weight[1:, 0] = 0.0
-            # Small bias initialization
-            self.conv.bias.fill_(0.0)
-
-    def forward(self, x):
-        """
-        Project disparity maps to latent space.
-        Input: disparity in range [-1, 1]
-        Output: projected to 4 channels with appropriate range for concatenation with VAE latents
-        """
-        return self.conv(x)
-
-
-class DisparityDecoder(ModelMixin, ConfigMixin):
-    """
-    Simple learned projection from latent space back to disparity maps.
+    VAE-based encoder-decoder for disparity maps with proper latent space regularization.
     """
     _supports_gradient_checkpointing = False
 
     @register_to_config
-    def __init__(self, in_channels=4, out_channels=1):
-        super(DisparityDecoder, self).__init__()
-
-        # Simple 1x1 conv projection with learnable scaling
-        self.conv = nn.Conv2d(
-            in_channels=in_channels, out_channels=out_channels, kernel_size=1, bias=True
+    def __init__(self, in_channels=1, latent_channels=4, hidden_channels=64):
+        super(DisparityVAE, self).__init__()
+        
+        self.latent_channels = latent_channels
+        
+        # Encoder network
+        self.encoder = nn.Sequential(
+            # Initial conv to increase channels
+            nn.Conv2d(in_channels, hidden_channels // 4, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_channels // 4, hidden_channels // 2, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_channels // 2, hidden_channels, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
         )
-
-        # Initialize to primarily use the first channel (which should contain disparity)
-        with torch.no_grad():
-            # Initialize to primarily use first channel
-            self.conv.weight[0, 0] = 0.25  # Inverse of encoder scaling (1/4)
-            self.conv.weight[0, 1:] = (
-                0.0  # Start with other channels having no contribution
-            )
-            self.conv.bias.fill_(0.0)
-
-    def forward(self, x):
+        
+        # Split into mean and log variance
+        self.mu_head = nn.Conv2d(hidden_channels, latent_channels, kernel_size=1)
+        self.logvar_head = nn.Conv2d(hidden_channels, latent_channels, kernel_size=1)
+        
+        # Decoder network
+        self.decoder = nn.Sequential(
+            nn.Conv2d(latent_channels, hidden_channels, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_channels, hidden_channels // 2, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_channels // 2, hidden_channels // 4, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_channels // 4, in_channels, kernel_size=3, padding=1),
+            nn.Tanh()  # Output in [-1, 1] range
+        )
+        
+        # Initialize weights
+        self._init_weights()
+    
+    def _init_weights(self):
+        """Initialize weights with appropriate scaling."""
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+        
+        # Initialize logvar head to small negative values (small initial variance)
+        nn.init.constant_(self.logvar_head.weight, 0)
+        nn.init.constant_(self.logvar_head.bias, -2.0)
+    
+    def encode(self, x):
         """
-        Project latent space back to disparity maps.
-        Input: 4-channel latents
-        Output: disparity in range approximately [-1, 1]
+        Encode input to latent parameters.
+        Returns: (mu, logvar) tensors
         """
-        return self.conv(x)
+        h = self.encoder(x)
+        mu = self.mu_head(h)
+        logvar = self.logvar_head(h)
+        return mu, logvar
+    
+    def reparameterize(self, mu, logvar):
+        """
+        Reparameterization trick for sampling from latent distribution.
+        """
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+    
+    def decode(self, z):
+        """
+        Decode latent representation back to disparity.
+        """
+        return self.decoder(z)
+    
+    def forward(self, x, return_distribution=False):
+        """
+        Full forward pass through VAE.
+        
+        Args:
+            x: Input disparity maps in range [-1, 1]
+            return_distribution: If True, returns (z, mu, logvar, reconstruction)
+                                If False, returns just z (for compatibility with existing code)
+        """
+        mu, logvar = self.encode(x)
+        z = self.reparameterize(mu, logvar)
+        
+        if return_distribution:
+            reconstruction = self.decode(z)
+            return z, mu, logvar, reconstruction
+        else:
+            return z
+    
+    def compute_vae_loss(self, x, beta=1.0):
+        """
+        Compute VAE loss including reconstruction and KL divergence.
+        
+        Args:
+            x: Input disparity maps
+            beta: Weight for KL divergence (beta-VAE)
+        
+        Returns:
+            total_loss, reconstruction_loss, kl_loss, reconstruction
+        """
+        z, mu, logvar, reconstruction = self.forward(x, return_distribution=True)
+        
+        # Reconstruction loss
+        reconstruction_loss = F.mse_loss(reconstruction, x, reduction='mean')
+        
+        # KL divergence loss
+        kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=[1, 2, 3])
+        kl_loss = kl_loss.mean()
+        
+        # Total loss
+        total_loss = reconstruction_loss + beta * kl_loss
+        
+        return total_loss, reconstruction_loss, kl_loss, reconstruction
+
+
+
 
 
 class DirectDiffusionControlNetPipeline(
@@ -248,8 +303,7 @@ class DirectDiffusionControlNetPipeline(
         safety_checker: StableDiffusionSafetyChecker,
         feature_extractor: CLIPImageProcessor,
         image_encoder: CLIPVisionModelWithProjection = None,
-        disparity_encoder: DisparityEncoder = None,
-        disparity_decoder: DisparityDecoder = None,
+        disparity_vae: DisparityVAE = None,
         requires_safety_checker: bool = True,
     ):
         super().__init__()
@@ -331,8 +385,7 @@ class DirectDiffusionControlNetPipeline(
             safety_checker=safety_checker,
             feature_extractor=feature_extractor,
             image_encoder=image_encoder,
-            disparity_encoder=disparity_encoder,
-            disparity_decoder=disparity_decoder,
+            disparity_vae=disparity_vae,
         )
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
@@ -580,22 +633,28 @@ class DirectDiffusionControlNetPipeline(
             return image_embeds, uncond_image_embeds
 
     def encode_disparity(self, disparity, device):
-        if self.disparity_encoder is None:
+        if self.disparity_vae is None:
             return disparity
-        dtype = next(self.disparity_encoder.parameters()).dtype
+        dtype = next(self.disparity_vae.parameters()).dtype
         if not isinstance(disparity, torch.Tensor):
             disparity = torch.tensor(disparity, dtype=dtype)
         disparity = disparity.to(device=device, dtype=dtype)
-        return self.disparity_encoder(disparity)
+        
+        # Use VAE encoder
+        mu, logvar = self.disparity_vae.encode(disparity)
+        if self.disparity_vae.training:
+            return self.disparity_vae.reparameterize(mu, logvar)
+        else:
+            return mu
 
     def decode_disparity(self, disparity, device):
-        if self.disparity_decoder is None:
+        if self.disparity_vae is None:
             return disparity
-        dtype = next(self.disparity_decoder.parameters()).dtype
+        dtype = next(self.disparity_vae.parameters()).dtype
         if not isinstance(disparity, torch.Tensor):
             disparity = torch.tensor(disparity, dtype=dtype)
         disparity = disparity.to(device=device, dtype=dtype)
-        return self.disparity_decoder(disparity)
+        return self.disparity_vae.decode(disparity)
 
     def prepare_ip_adapter_image_embeds(
         self, ip_adapter_image, ip_adapter_image_embeds, device, num_images_per_prompt, do_classifier_free_guidance
@@ -1806,9 +1865,9 @@ class SDaIGControlNetPipeline(DirectDiffusionControlNetPipeline):
         if len(timesteps) > 1:
             latents = torch.cat([latents[:, :4], latents[:, 4:]], dim=0)
         if not output_type == "latent":
-            if self.disparity_decoder is not None:
+            if self.disparity_vae is not None:
                 raise ValueError(
-                    "output_type has to be 'latent' when using disparity decoder"
+                    "output_type has to be 'latent' when using disparity VAE"
                 )
             else:
                 image = self.vae.decode(
