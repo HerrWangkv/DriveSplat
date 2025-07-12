@@ -1042,7 +1042,7 @@ def main():
 
         train_loss = 0.0
         log_disparity_loss = 0.0
-        log_reconstruction_loss = 0.0
+        log_vae_loss = 0.0
         log_rgb_loss = 0.0
 
         for _ in range(len(train_dataloader)):
@@ -1431,16 +1431,16 @@ def main():
                 # Gather loss
                 avg_disparity_loss = accelerator.gather(disparity_loss.repeat(args.train_batch_size*6)).mean()
                 log_disparity_loss += avg_disparity_loss.item() / args.gradient_accumulation_steps
-                avg_vae_reconstruction_loss = accelerator.gather(
-                    vae_reconstruction_loss.repeat(args.train_batch_size * 6)
+                avg_vae_loss = accelerator.gather(
+                    vae_loss.repeat(args.train_batch_size * 6)
                 ).mean()
-                log_reconstruction_loss += (
-                    avg_vae_reconstruction_loss.item()
+                log_vae_loss += (
+                    avg_vae_loss.item()
                     / args.gradient_accumulation_steps
                 )
                 avg_rgb_loss = accelerator.gather(rgb_loss.repeat(args.train_batch_size*6)).mean()
                 log_rgb_loss += avg_rgb_loss.item() / args.gradient_accumulation_steps
-                train_loss = log_disparity_loss + log_reconstruction_loss + log_rgb_loss
+                train_loss = log_disparity_loss + log_vae_loss + log_rgb_loss
 
                 # Backpropagate
                 accelerator.backward(loss)
@@ -1478,14 +1478,14 @@ def main():
                     {
                         "train_loss": train_loss,
                         "disparity_loss": log_disparity_loss,
-                        "reconstruction_loss": log_reconstruction_loss,
+                        "vae_loss": log_vae_loss,
                         "rgb_loss": log_rgb_loss,
                     },
                     step=global_step,
                 )
                 train_loss = 0.0
                 log_disparity_loss = 0.0
-                log_reconstruction_loss = 0.0
+                log_vae_loss = 0.0
                 log_rgb_loss = 0.0
 
                 checkpointing_steps = args.checkpointing_steps
