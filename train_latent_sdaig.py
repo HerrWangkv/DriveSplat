@@ -55,7 +55,7 @@ from diffusers.utils.import_utils import is_xformers_available
 from diffusers.utils.torch_utils import is_compiled_module
 from diffusers.models.controlnet import ControlNetModel
 
-from pipeline import SDaIGControlNetPipeline, DisparityVAE
+from pipeline import SDaIGControlNetPipeline, LatentDisparityDecoder
 from data import build_dataset_from_cfg
 from utils.img_utils import (
     concat_6_views,
@@ -83,11 +83,11 @@ def run_example_validation(pipeline, batch, args, step, generator, weight_dtype)
         batch[("pixel_values", 0)].squeeze().to(weight_dtype)
     ).latent_dist.sample()
     current_features *= pipeline.vae.config.scaling_factor
-    current_disparity_maps = (batch[("disparity_maps", 0)].squeeze() + 1) / 2
+    current_disparity_maps = (batch[("latent_disparity_maps", 0)].squeeze() + 1) / 2
     novel_features = render_novel_views_using_point_cloud(
         current_features=current_features.float(),
         current_depths=set_inf_to_max(disparity2depth(current_disparity_maps)),
-        current_ego_mask=batch["ego_masks"].squeeze(),
+        current_ego_mask=batch["latent_ego_masks"].squeeze(),
         current_intrinsics=batch["latent_intrinsics"].squeeze(),
         current_extrinsics=batch["extrinsics", 0].squeeze(),
         novel_intrinsics=batch["latent_intrinsics"].squeeze(),
@@ -128,13 +128,15 @@ def run_example_validation(pipeline, batch, args, step, generator, weight_dtype)
     concat_and_visualize_6_depths(
         depth_gt,
         save_path=os.path.join(args.output_dir, f"{step}_depth_gt.png"),
+        vmax=200,
     )
-    box_disparity_gt = (batch["box_disparity_maps", 1][0].cpu().numpy() + 1) / 2
+    box_disparity_gt = (batch["latent_box_disparity_maps", 1][0].cpu().numpy() + 1) / 2
     box_depth_gt = disparity2depth(box_disparity_gt)
     box_depth_gt = set_inf_to_max(box_depth_gt)
     concat_and_visualize_6_depths(
         box_depth_gt,
         save_path=os.path.join(args.output_dir, f"{step}_depth_cond.png"),
+        vmax=200,
     )
     if torch.backends.mps.is_available():
         autocast_ctx = nullcontext()
@@ -145,7 +147,7 @@ def run_example_validation(pipeline, batch, args, step, generator, weight_dtype)
         if args.multi_step_training:
             # Multi-step inference with proper denoising steps
             preds = pipeline(
-                disparity_cond=batch["box_disparity_maps", 1][0],
+                disparity_cond=batch["latent_box_disparity_maps", 1][0],
                 rgb_cond=novel_features,
                 prompt=["" for _ in range(batch["pixel_values", 1].shape[1])],
                 num_inference_steps=args.num_inference_steps,
@@ -155,7 +157,7 @@ def run_example_validation(pipeline, batch, args, step, generator, weight_dtype)
         else:
             # Single-step inference
             preds = pipeline(
-                disparity_cond=batch["box_disparity_maps", 1][0],
+                disparity_cond=batch["latent_box_disparity_maps", 1][0],
                 rgb_cond=novel_features,
                 prompt=["" for _ in range(batch["pixel_values", 1].shape[1])],
                 num_inference_steps=1,
@@ -166,85 +168,40 @@ def run_example_validation(pipeline, batch, args, step, generator, weight_dtype)
         rgb_latents = preds[: len(preds) // 2]  # [B, 4, H//8, W//8]
         disparity_latents = preds[len(preds) // 2 :]  # [B, 4, H//8, W//8]
 
-        # Debug: Print shapes and some statistics
-        print(f"VALIDATION DEBUG:")
-        # print(f"  preds.shape = {preds.shape}")
-        # print(f"  rgb_latents.shape = {rgb_latents.shape}")
-        # print(f"  disparity_latents.shape = {disparity_latents.shape}")
-        print(
-            f"  rgb_latents stats: min={rgb_latents.min():.4f}, max={rgb_latents.max():.4f}, mean={rgb_latents.mean():.4f}"
-        )
-        print(
-            f"  disparity_latents stats: min={disparity_latents.min():.4f}, max={disparity_latents.max():.4f}, mean={disparity_latents.mean():.4f}"
-        )
-
         rgb_out = pipeline.vae.decode(
             rgb_latents / pipeline.vae.config.scaling_factor,
             return_dict=False,
             generator=generator,
         )[0]
         rgb_out = (rgb_out / 2 + 0.5).clamp(0, 1)  # Normalize to [0, 1]
-
-        disparity_out = pipeline.decode_disparity(
-            disparity_latents, pipeline.device
-        )  # [B, 1, H//8, W//8]
-        print(
-            f"  disparity_out (before norm) stats: min={disparity_out.min():.4f}, max={disparity_out.max():.4f}, mean={disparity_out.mean():.4f}, std={disparity_out.std():.4f}"
-        )
-
-        # Check if output is degenerate (all similar values)
-        unique_vals = torch.unique(
-            disparity_out.flatten()[:1000]
-        )  # Sample first 1000 values
-        print(
-            f"  Number of unique values in disparity_out (sample): {len(unique_vals)}"
-        )
-        if len(unique_vals) < 10:
-            print(
-                f"  WARNING: disparity_out appears degenerate, unique values: {unique_vals[:10]}"
-            )
-
-        disparity_out = (disparity_out / 2 + 0.5).clamp(0, 1)  # Normalize to [0, 1]
-        print(
-            f"  disparity_out (after norm) stats: min={disparity_out.min():.4f}, max={disparity_out.max():.4f}, mean={disparity_out.mean():.4f}, std={disparity_out.std():.4f}"
-        )
-
-        # Compare with ground truth disparity range
-        gt_disparity_normalized = (batch["disparity_maps", 1][0] + 1) / 2
-        print(
-            f"  GT disparity stats: min={gt_disparity_normalized.min():.4f}, max={gt_disparity_normalized.max():.4f}, mean={gt_disparity_normalized.mean():.4f}, std={gt_disparity_normalized.std():.4f}"
-        )
-
-        # Debug: Compare with ground truth disparity
-        disparity_gt_tensor = batch["disparity_maps", 1][0]
-
-        # Debug: Test encoder-decoder round trip on ground truth
-        gt_encoded = pipeline.encode_disparity(disparity_gt_tensor, pipeline.device)
-        gt_decoded = pipeline.decode_disparity(gt_encoded, pipeline.device)
-        gt_decoded_norm = gt_decoded
-        print(f"  GT encode-decode test:")
-        print(
-            f"    GT original: min={disparity_gt_tensor.min():.4f}, max={disparity_gt_tensor.max():.4f}, mean={disparity_gt_tensor.mean():.4f}"
-        )
-        print(
-            f"    GT encoded: min={gt_encoded.min():.4f}, max={gt_encoded.max():.4f}, mean={gt_encoded.mean():.4f}"
-        )
-        print(
-            f"    GT decoded: min={gt_decoded_norm.min():.4f}, max={gt_decoded_norm.max():.4f}, mean={gt_decoded_norm.mean():.4f}"
-        )
-        print(
-            f"    Round-trip MSE: {F.mse_loss(gt_decoded_norm, disparity_gt_tensor):.6f}"
-        )
-
-        depth_out = set_inf_to_max(disparity2depth(disparity_out))
-        concat_and_visualize_6_depths(
-            depth_out,
-            save_path=os.path.join(args.output_dir, f"{step}_depth_out.png"),
-            vmax=np.max(depth_gt) if depth_gt is not None else None,
-        )
         concat_6_views(
             rgb_out,
         ).save(os.path.join(args.output_dir, f"{step}_rgb_out.png"))
+
+        disparity_out = pipeline.vae.decode(
+            disparity_latents / pipeline.vae.config.scaling_factor,
+            return_dict=False,
+            generator=generator,
+        )[0]
+        disparity_out = disparity_out.mean(dim=1)
+        disparity_out = (disparity_out / 2 + 0.5).clamp(0, 1)  # Normalize to [0, 1]
+        concat_and_visualize_6_depths(
+            set_inf_to_max(disparity2depth(disparity_out)),
+            save_path=os.path.join(args.output_dir, f"{step}_depth_out.png"),
+            vmax=200,
+        )
+
+        latent_disparity_out = pipeline.decode_latent_disparity(
+            disparity_latents, pipeline.device
+        )
+        latent_disparity_out = (latent_disparity_out / 2 + 0.5).clamp(
+            0, 1
+        )  # Normalize to [0, 1]
+        concat_and_visualize_6_depths(
+            set_inf_to_max(disparity2depth(latent_disparity_out)),
+            save_path=os.path.join(args.output_dir, f"{step}_latent_depth_out.png"),
+            vmax=200,
+        )
 
 
 def log_validation(
@@ -254,7 +211,7 @@ def log_validation(
     tokenizer,
     unet,
     controlnet,
-    disparity_vae,
+    latent_disparity_decoder,
     args,
     accelerator,
     weight_dtype,
@@ -280,7 +237,7 @@ def log_validation(
         safety_checker=None,
         feature_extractor=None,
         requires_safety_checker=False,
-        disparity_vae=accelerator.unwrap_model(disparity_vae),
+        latent_disparity_decoder=accelerator.unwrap_model(latent_disparity_decoder),
     )
 
     pipeline = pipeline.to(accelerator.device)
@@ -326,12 +283,6 @@ def parse_args():
         default=None,
         help="Path to pretrained controlnet model or model identifier from huggingface.co/models."
         " If not specified controlnet weights are initialized from unet.",
-    )
-    parser.add_argument(
-        "--disparity_encoder_model_name_or_path",
-        type=str,
-        default=None,
-        help="Path to pretrained disparity encoder model. If not specified, disparity encoder weights are initialized randomly.",
     )
     parser.add_argument(
         "--disparity_decoder_model_name_or_path",
@@ -704,36 +655,37 @@ def main():
     else:
         logger.info("Initializing controlnet weights from unet")
         controlnet = ControlNetModel.from_unet(
-            unet, conditioning_channels=8, conditioning_embedding_out_channels=(256,)
+            unet, conditioning_channels=5, conditioning_embedding_out_channels=(256,)
         )
 
-    # Initialize disparity encoder and decoder
+    # Initialize disparity decoder
     # Try loading from specific paths first, then check controlnet path, finally initialize new
-    if args.disparity_encoder_model_name_or_path:
+    if args.disparity_decoder_model_name_or_path:
         logger.info(
-            f"Loading disparity VAE from {args.disparity_encoder_model_name_or_path}"
+            f"Loading disparity VAE from {args.disparity_decoder_model_name_or_path}"
         )
-        disparity_vae = DisparityVAE.from_pretrained(
-            args.disparity_encoder_model_name_or_path
+        latent_disparity_decoder = LatentDisparityDecoder.from_pretrained(
+            args.disparity_decoder_model_name_or_path
         )
     elif args.pretrained_model_name_or_path and os.path.exists(
-        os.path.join(args.pretrained_model_name_or_path, "disparity_vae")
+        os.path.join(args.pretrained_model_name_or_path, "latent_disparity_decoder")
     ):
         logger.info("Loading existing disparity VAE weights from pretrained model path")
-        disparity_vae = DisparityVAE.from_pretrained(
-            args.pretrained_model_name_or_path, subfolder="disparity_vae"
+        latent_disparity_decoder = LatentDisparityDecoder.from_pretrained(
+            args.pretrained_model_name_or_path, subfolder="latent_disparity_decoder"
         )
     else:
-        logger.info("Initializing new disparity VAE weights")
-        disparity_vae = DisparityVAE(in_channels=1, latent_channels=4)
+        logger.info("Initializing new latent disparity decoder weights")
+        latent_disparity_decoder = LatentDisparityDecoder(
+            in_channels=1, latent_channels=4
+        )
 
-    # Freeze vae and text_encoder and set unet, controlnet, and disparity_vae to trainable
+    # Freeze vae and text_encoder and set unet, controlnet, and latent_disparity_decoder to trainable
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
     unet.train()
     controlnet.train()
-    disparity_vae.train()
-    disparity_vae.train()
+    latent_disparity_decoder.train()
 
     if args.enable_xformers_memory_efficient_attention:
         if is_xformers_available():
@@ -754,24 +706,24 @@ def main():
         def save_model_hook(models, weights, output_dir):
             if accelerator.is_main_process:
                 # Save UNet, ControlNet, and disparity encoder/decoder
-                # The models list contains [unet, controlnet, disparity_vae] in the order from accelerator.prepare()
+                # The models list contains [unet, controlnet, latent_disparity_decoder] in the order from accelerator.prepare()
                 if len(models) >= 3:
                     unet_model = models[0]
                     controlnet_model = models[1]
-                    disparity_vae_model = models[2]
+                    latent_disparity_decoder_model = models[2]
 
                     unet_model.save_pretrained(os.path.join(output_dir, "unet"))
                     controlnet_model.save_pretrained(os.path.join(output_dir, "controlnet"))
 
                     # Save disparity VAE using its save_pretrained method
-                    disparity_vae_model.save_pretrained(
-                        os.path.join(output_dir, "disparity_vae")
+                    latent_disparity_decoder_model.save_pretrained(
+                        os.path.join(output_dir, "latent_disparity_decoder")
                     )
 
                     # Pop weights for all models
                     weights.pop()  # UNet
                     weights.pop()  # ControlNet
-                    weights.pop()  # DisparityVAE
+                    weights.pop()  # LatentDisparityDecoder
                 else:
                     # Fallback for backward compatibility
                     models[0].save_pretrained(os.path.join(output_dir, "unet"))
@@ -783,14 +735,18 @@ def main():
         def load_model_hook(models, input_dir):
             # Load UNet, ControlNet, and disparity VAE
             if len(models) >= 3:
-                # Pop and load DisparityVAE (third model)
-                disparity_vae_model = models.pop()
-                if os.path.exists(os.path.join(input_dir, "disparity_vae")):
-                    load_disparity_vae = DisparityVAE.from_pretrained(
-                        input_dir, subfolder="disparity_vae"
+                # Pop and load LatentDisparityDecoder (third model)
+                latent_disparity_decoder_model = models.pop()
+                if os.path.exists(os.path.join(input_dir, "latent_disparity_decoder")):
+                    load_latent_disparity_decoder = (
+                        LatentDisparityDecoder.from_pretrained(
+                            input_dir, subfolder="latent_disparity_decoder"
+                        )
                     )
-                    disparity_vae_model.load_state_dict(load_disparity_vae.state_dict())
-                    del load_disparity_vae
+                    latent_disparity_decoder_model.load_state_dict(
+                        load_latent_disparity_decoder.state_dict()
+                    )
+                    del load_latent_disparity_decoder
 
                 # Pop and load ControlNet (second model)
                 controlnet_model = models.pop()
@@ -827,11 +783,11 @@ def main():
         controlnet.enable_gradient_checkpointing()
         # Only enable gradient checkpointing if the models support it
         if (
-            hasattr(disparity_vae, "enable_gradient_checkpointing")
-            and hasattr(disparity_vae, "_supports_gradient_checkpointing")
-            and disparity_vae._supports_gradient_checkpointing
+            hasattr(latent_disparity_decoder, "enable_gradient_checkpointing")
+            and hasattr(latent_disparity_decoder, "_supports_gradient_checkpointing")
+            and latent_disparity_decoder._supports_gradient_checkpointing
         ):
-            disparity_vae.enable_gradient_checkpointing()
+            latent_disparity_decoder.enable_gradient_checkpointing()
         else:
             logger.warning(
                 "DisparityVAE does not support gradient checkpointing, skipping."
@@ -864,7 +820,7 @@ def main():
     trainable_params = (
         list(unet.parameters())
         + list(controlnet.parameters())
-        + list(disparity_vae.parameters())
+        + list(latent_disparity_decoder.parameters())
     )
 
     optimizer = optimizer_cls(
@@ -927,14 +883,14 @@ def main():
     (
         unet,
         controlnet,
-        disparity_vae,
+        latent_disparity_decoder,
         optimizer,
         train_dataloader,
         lr_scheduler,
     ) = accelerator.prepare(
         unet,
         controlnet,
-        disparity_vae,
+        latent_disparity_decoder,
         optimizer,
         train_dataloader,
         lr_scheduler,
@@ -1042,7 +998,7 @@ def main():
 
         train_loss = 0.0
         log_disparity_loss = 0.0
-        log_vae_loss = 0.0
+        log_reconstruction_loss = 0.0
         log_rgb_loss = 0.0
 
         for _ in range(len(train_dataloader)):
@@ -1056,7 +1012,7 @@ def main():
                     current_features = vae.encode(batch[("pixel_values", 0)].squeeze().to(weight_dtype)).latent_dist.sample()
                     current_features *= vae.config.scaling_factor
                     current_disparity_maps = (
-                        batch[("disparity_maps", 0)].squeeze() + 1
+                        batch[("latent_disparity_maps", 0)].squeeze() + 1
                     ) / 2
 
                     novel_features = render_novel_views_using_point_cloud(
@@ -1064,7 +1020,7 @@ def main():
                         current_depths=set_inf_to_max(
                             disparity2depth(current_disparity_maps)
                         ),
-                        current_ego_mask=batch["ego_masks"].squeeze(),
+                        current_ego_mask=batch["latent_ego_masks"].squeeze(),
                         current_intrinsics=batch["latent_intrinsics"].squeeze(),
                         current_extrinsics=batch["extrinsics", 0].squeeze(),
                         novel_intrinsics=batch["latent_intrinsics"].squeeze(),
@@ -1100,21 +1056,31 @@ def main():
                     #     batch[("pixel_values", 1)].squeeze() / 2 + 0.5
                     # ).save("novel_gt.png")
                 pixel_values = batch[("pixel_values", 1)]  # Shape: [batch_size, 6, 3, H, W]
+                disparity_maps = batch[("disparity_maps", 1)].expand(
+                    -1, -1, 3, -1, -1
+                )  # Shape: [batch_size, 6, 3, H, W]
                 latent_disparity_maps = batch[
-                    ("disparity_maps", 1)
+                    ("latent_disparity_maps", 1)
                 ]  # Shape: [batch_size, 6, 1, H//8, W//8]
-                ego_masks = batch["ego_masks"]  # [batch_size, 6, 1, H//8, W//8]
-                latent_box_disparity_maps = batch[("box_disparity_maps", 1)]  # Shape: [batch_size, 6, 1, H//8, W//8]
+                latent_ego_masks = batch[
+                    "latent_ego_masks"
+                ]  # [batch_size, 6, 1, H//8, W//8]
+                latent_box_disparity_maps = batch[
+                    ("latent_box_disparity_maps", 1)
+                ]  # Shape: [batch_size, 6, 1, H//8, W//8]
 
                 # Reshape from [batch_size, 6, ...] to [6*batch_size, ...] using view
                 pixel_values = pixel_values.view(
                     6 * args.train_batch_size, *pixel_values.shape[2:]
                 )  # [6*batch_size, 3, H, W]
+                disparity_maps = disparity_maps.view(
+                    6 * args.train_batch_size, *disparity_maps.shape[2:]
+                )  # [6*batch_size, 3, H, W]
                 latent_disparity_maps = latent_disparity_maps.view(
                     6 * args.train_batch_size, *latent_disparity_maps.shape[2:]
                 )  # [6*batch_size, 1, H//8, W//8]
-                ego_masks = ego_masks.view(
-                    6 * args.train_batch_size, *ego_masks.shape[2:]
+                latent_ego_masks = latent_ego_masks.view(
+                    6 * args.train_batch_size, *latent_ego_masks.shape[2:]
                 )  # [6*batch_size, 1, H, W]
                 latent_box_disparity_maps = latent_box_disparity_maps.view(
                     6 * args.train_batch_size, *latent_box_disparity_maps.shape[2:]
@@ -1125,41 +1091,24 @@ def main():
                     torch.cat((pixel_values, pixel_values), dim=0).to(weight_dtype)
                     ).latent_dist.sample()
                 rgb_latents = rgb_latents * vae.config.scaling_factor
-
-                # Encode disparity maps to latent space using disparity VAE
-                # Use the VAE encoder to get the latent representation
-                # Access the underlying module when using distributed training
-                disparity_vae_module = (
-                    disparity_vae.module
-                    if hasattr(disparity_vae, "module")
-                    else disparity_vae
-                )
-                # Get the actual dtype of the VAE parameters to match input
-                vae_dtype = next(disparity_vae_module.parameters()).dtype
-                disparity_input = torch.cat(
-                    (latent_disparity_maps, latent_disparity_maps), dim=0
-                ).to(vae_dtype)
-                mu, logvar = disparity_vae_module.encode(disparity_input)
-                disparity_latents = (
-                    disparity_vae_module.reparameterize(mu, logvar)
-                    if disparity_vae_module.training
-                    else mu
-                )
-                disparity_latents_detached = disparity_latents.detach()
+                disparity_latents = vae.encode(
+                    torch.cat((disparity_maps, disparity_maps), dim=0).to(weight_dtype)
+                ).latent_dist.sample()
+                disparity_latents = disparity_latents * vae.config.scaling_factor
 
                 torch.cuda.empty_cache()
 
                 bsz = disparity_latents.shape[0]
                 bsz_per_task = int(bsz/2)
 
-                # Get the valid mask for the latent space
-                valid_mask = ~ego_masks
+                latent_disparity_decoder_module = (
+                    latent_disparity_decoder.module
+                    if hasattr(latent_disparity_decoder, "module")
+                    else latent_disparity_decoder
+                )
 
-                # Debug: Check valid mask dimensions and coverage
-                # print(f"DEBUG: ego_masks shape: {ego_masks.shape}")
-                # print(f"DEBUG: valid_mask shape: {valid_mask.shape}")
-                # print(f"DEBUG: disparity_latents shape: {disparity_latents.shape}")
-                # print(f"DEBUG: valid_mask coverage: {valid_mask.float().mean():.4f}")
+                # Get the valid mask for the latent space
+                valid_mask = ~latent_ego_masks
 
                 # Ensure valid_mask is properly sized for latent space
                 if valid_mask.shape[-2:] != disparity_latents.shape[-2:]:
@@ -1207,29 +1156,16 @@ def main():
                 if args.input_perturbation:
                     noisy_rgb_latents = noise_scheduler.add_noise(rgb_latents, new_rgb_noise, timesteps)
                     noisy_disparity_latents = noise_scheduler.add_noise(
-                        disparity_latents_detached, new_disparity_noise, timesteps
+                        disparity_latents, new_disparity_noise, timesteps
                     )
                 else:
                     noisy_rgb_latents = noise_scheduler.add_noise(rgb_latents, rgb_noise, timesteps)
                     noisy_disparity_latents = noise_scheduler.add_noise(
-                        disparity_latents_detached, disparity_noise, timesteps
+                        disparity_latents, disparity_noise, timesteps
                     )
 
-                # Concatenate rgb and depth using VAE encoder
-                # Ensure input dtype matches VAE parameters
-                vae_dtype = next(disparity_vae_module.parameters()).dtype
-                latent_box_mu, latent_box_logvar = disparity_vae_module.encode(
-                    latent_box_disparity_maps.to(vae_dtype)
-                )
-                latent_box_encoded = (
-                    disparity_vae_module.reparameterize(
-                        latent_box_mu, latent_box_logvar
-                    )
-                    if disparity_vae_module.training
-                    else latent_box_mu
-                )
                 controlnet_cond = torch.cat(
-                    [novel_features, latent_box_encoded],
+                    [novel_features, latent_box_disparity_maps],
                     dim=1,
                 )  # [6*batch_size, 5, H, W]
                 controlnet_cond = torch.cat([controlnet_cond, controlnet_cond], dim=0)
@@ -1294,153 +1230,33 @@ def main():
                     reduction="mean",
                 )
 
-                # Decode predicted disparity latents and compute loss in disparity space
-                predicted_disparity_latents = model_pred[bsz_per_task:]
-                target_disparity_latents = disparity_latents_detached[bsz_per_task:]
-
-                # Check for degenerate predictions
-                pred_unique = torch.unique(predicted_disparity_latents.flatten()[:1000])
-                target_unique = torch.unique(target_disparity_latents.flatten()[:1000])
-
-                # Debug: Check what we're actually comparing in the loss
-                pred_valid = predicted_disparity_latents[
-                    valid_mask.expand(-1, 4, -1, -1)
-                ].float()
-                target_valid = target_disparity_latents[
-                    valid_mask.expand(-1, 4, -1, -1)
-                ].float()
-
-                # print(
-                #     f"DEBUG: Valid region stats - pred: min={pred_valid.min():.4f}, max={pred_valid.max():.4f}, mean={pred_valid.mean():.4f}, std={pred_valid.std():.4f}"
-                # )
-                # print(
-                #     f"DEBUG: Valid region stats - target: min={target_valid.min():.4f}, max={target_valid.max():.4f}, mean={target_valid.mean():.4f}, std={target_valid.std():.4f}"
-                # )
-                # print(f"DEBUG: Valid region size: {len(pred_valid)} elements")
-
-                disparity_loss = F.mse_loss(pred_valid, target_valid, reduction="mean")
-
-                # Add VAE reconstruction loss to train encoder-decoder mapping
-                # This ensures the encoder-decoder learns to preserve disparity information
-                # and regularizes the latent space with KL divergence
-
-                # Compute VAE loss using the disparity VAE model with warmup
-                # VAE warmup: gradually increase KL weight to prevent collapse
-                warmup_steps = 1000
-                kl_weight = (
-                    min(0.001, 0.001 * (global_step / warmup_steps))
-                    if global_step < warmup_steps
-                    else 0.001
+                disparity_loss = F.mse_loss(
+                    model_pred[bsz_per_task:].float(),
+                    disparity_latents[bsz_per_task:].float(),
+                    reduction="mean",
                 )
 
-                vae_loss, vae_reconstruction_loss, kl_loss, target_reconstructed = (
-                    disparity_vae_module.compute_vae_loss(
-                        latent_disparity_maps,
-                        beta=kl_weight,  # Use dynamic KL weight
+                reconstruction_loss = (
+                    latent_disparity_decoder_module.compute_reconstruction_loss(
+                        latents=disparity_latents[bsz_per_task:].float(),
+                        target_disparity=latent_disparity_maps.float(),
                     )
                 )
 
-                total_disparity_loss = (
-                    disparity_loss + 0.01 * vae_loss
-                )  # Further reduce VAE weight
-
-                # The variance regularization is now handled by the KL divergence in the VAE
-                # No need for manual variance penalty anymore
-
-                # Debug: Print training statistics occasionally
-                if global_step % 100 == 0:
-                    print(f"TRAINING DEBUG (step {global_step}):")
-                    print(
-                        f"  predicted_disparity_latents stats: min={predicted_disparity_latents.min():.4f}, max={predicted_disparity_latents.max():.4f}, mean={predicted_disparity_latents.mean():.4f}"
-                    )
-                    print(f"  valid_mask sum: {valid_mask.sum()}")
-                    print(f"  kl_weight: {kl_weight:.6f}")
-                    print(f"  disparity_loss: {disparity_loss:.6f}")
-                    print(f"  vae_reconstruction_loss: {vae_reconstruction_loss:.6f}")
-                    print(f"  kl_loss: {kl_loss:.6f}")
-                    print(f"  vae_loss: {vae_loss:.6f}")
-                    print(f"  total_disparity_loss: {total_disparity_loss:.6f}")
-                    print(f"  rgb_loss: {rgb_loss:.6f}")
-
-                    # Test encoder-decoder round trip on target disparity (should be very similar to reconstruction loss)
-                    round_trip_mse = F.mse_loss(
-                        target_reconstructed, latent_disparity_maps
-                    )
-                    print(f"  Encoder-decoder round-trip MSE: {round_trip_mse:.6f}")
-
-                    # Additional debugging for disparity understanding
-                    print(
-                        f"  Original latent_disparity_maps stats: min={latent_disparity_maps.min():.4f}, max={latent_disparity_maps.max():.4f}, mean={latent_disparity_maps.mean():.4f}"
-                    )
-                    print(
-                        f"  Encoded disparity_latents stats: min={disparity_latents[bsz_per_task:].min():.4f}, max={disparity_latents[bsz_per_task:].max():.4f}, mean={disparity_latents[bsz_per_task:].mean():.4f}"
-                    )
-                    print(
-                        f"  Reconstructed target_reconstructed stats: min={target_reconstructed.min():.4f}, max={target_reconstructed.max():.4f}, mean={target_reconstructed.mean():.4f}"
-                    )
-
-                    # Check if the predicted latents are actually meaningful
-                    predicted_reconstructed = disparity_vae_module.decode(
-                        predicted_disparity_latents
-                    )
-                    pred_recon_mse = F.mse_loss(
-                        predicted_reconstructed, latent_disparity_maps
-                    )
-                    print(f"  Predicted->Reconstructed MSE: {pred_recon_mse:.6f}")
-
-                    # Check latent space variance
-                    latent_variance = torch.var(
-                        predicted_disparity_latents, dim=[0, 2, 3]
-                    )
-                    print(f"  Predicted latent variance per channel: {latent_variance}")
-                    target_variance = torch.var(target_disparity_latents, dim=[0, 2, 3])
-                    print(f"  Target latent variance per channel: {target_variance}")
-
-                    # Check for degenerate solutions
-                    print(
-                        f"  Predicted latent unique values (sample): {len(pred_unique)}"
-                    )
-                    print(
-                        f"  Target latent unique values (sample): {len(target_unique)}"
-                    )
-                    if len(pred_unique) < 50:
-                        print(f"  WARNING: Predicted latents appear degenerate!")
-
-                    # Check valid mask coverage
-                    valid_ratio = valid_mask.float().mean()
-                    print(
-                        f"  Valid mask coverage: {valid_ratio:.4f} ({valid_mask.sum()} / {valid_mask.numel()} pixels)"
-                    )
-
-                    # Check disparity range in original space
-                    pred_disparity_decoded = disparity_vae_module.decode(
-                        predicted_disparity_latents
-                    )
-                    target_disparity_decoded = disparity_vae_module.decode(
-                        target_disparity_latents
-                    )
-                    print(
-                        f"  Predicted disparity (decoded) stats: min={pred_disparity_decoded.min():.4f}, max={pred_disparity_decoded.max():.4f}, std={pred_disparity_decoded.std():.4f}"
-                    )
-                    print(
-                        f"  Target disparity (decoded) stats: min={target_disparity_decoded.min():.4f}, max={target_disparity_decoded.max():.4f}, std={target_disparity_decoded.std():.4f}"
-                    )
-
-                loss = total_disparity_loss + rgb_loss
+                loss = disparity_loss + rgb_loss + reconstruction_loss
 
                 # Gather loss
                 avg_disparity_loss = accelerator.gather(disparity_loss.repeat(args.train_batch_size*6)).mean()
                 log_disparity_loss += avg_disparity_loss.item() / args.gradient_accumulation_steps
-                avg_vae_loss = accelerator.gather(
-                    vae_loss.repeat(args.train_batch_size * 6)
+                avg_reconstruction_loss = accelerator.gather(
+                    reconstruction_loss.repeat(args.train_batch_size * 6)
                 ).mean()
-                log_vae_loss += (
-                    avg_vae_loss.item()
-                    / args.gradient_accumulation_steps
+                log_reconstruction_loss += (
+                    avg_reconstruction_loss.item() / args.gradient_accumulation_steps
                 )
                 avg_rgb_loss = accelerator.gather(rgb_loss.repeat(args.train_batch_size*6)).mean()
                 log_rgb_loss += avg_rgb_loss.item() / args.gradient_accumulation_steps
-                train_loss = log_disparity_loss + log_vae_loss + log_rgb_loss
+                train_loss = log_disparity_loss + log_reconstruction_loss + log_rgb_loss
 
                 # Backpropagate
                 accelerator.backward(loss)
@@ -1449,7 +1265,7 @@ def main():
                     accelerator.clip_grad_norm_(
                         list(unet.parameters())
                         + list(controlnet.parameters())
-                        + list(disparity_vae.parameters()),
+                        + list(latent_disparity_decoder.parameters()),
                         args.max_grad_norm,
                     )
                 optimizer.step()
@@ -1461,12 +1277,9 @@ def main():
                     torch.cuda.empty_cache()
 
             logs = {
-                "SL": loss.detach().item(),
-                "SL_D": disparity_loss.detach().item(),
-                "SL_VAE": vae_loss.detach().item(),
-                "SL_KL": kl_loss.detach().item(),
-                "SL_R": rgb_loss.detach().item(),
-                "lr": lr_scheduler.get_last_lr()[0],
+                "Disparity": disparity_loss.detach().item(),
+                "RGB": rgb_loss.detach().item(),
+                "Reconstruction": reconstruction_loss.detach().item(),
             }
             progress_bar.set_postfix(**logs)
 
@@ -1478,14 +1291,14 @@ def main():
                     {
                         "train_loss": train_loss,
                         "disparity_loss": log_disparity_loss,
-                        "vae_loss": log_vae_loss,
+                        "reconstruction_loss": log_reconstruction_loss,
                         "rgb_loss": log_rgb_loss,
                     },
                     step=global_step,
                 )
                 train_loss = 0.0
                 log_disparity_loss = 0.0
-                log_vae_loss = 0.0
+                log_reconstruction_loss = 0.0
                 log_rgb_loss = 0.0
 
                 checkpointing_steps = args.checkpointing_steps
@@ -1526,7 +1339,7 @@ def main():
                             tokenizer,
                             unet,
                             controlnet,
-                            disparity_vae,
+                            latent_disparity_decoder,
                             args,
                             accelerator,
                             weight_dtype,
@@ -1542,7 +1355,7 @@ def main():
     if accelerator.is_main_process:
         unet = unwrap_model(unet)
         controlnet = unwrap_model(controlnet)
-        disparity_vae = unwrap_model(disparity_vae)
+        latent_disparity_decoder = unwrap_model(latent_disparity_decoder)
 
         pipeline = SDaIGControlNetPipeline.from_pretrained(
             args.pretrained_model_name_or_path,
@@ -1550,7 +1363,7 @@ def main():
             vae=vae,
             unet=unet,
             controlnet=controlnet,
-            disparity_vae=disparity_vae,
+            latent_disparity_decoder=latent_disparity_decoder,
             revision=args.revision,
             variant=args.variant,
         )
