@@ -12,7 +12,7 @@ from diffusers import UNet2DConditionModel
 from diffusers.models.controlnet import ControlNetModel
 from diffusers.utils import check_min_version
 
-from pipeline import SDaIGControlNetPipeline
+from pipeline import SDaIGControlNetPipeline, LatentDisparityDecoder
 from data import build_dataset_from_cfg
 from utils.img_utils import (
     concat_6_views,
@@ -192,9 +192,12 @@ def main():
     checkpoint_controlnet_path = os.path.join(
         args.pretrained_model_name_or_path, "controlnet"
     )
+    latent_disparity_decoder_path = os.path.join(
+        args.pretrained_model_name_or_path, "latent_disparity_decoder"
+    )
 
     if os.path.exists(checkpoint_unet_path) and os.path.exists(
-        checkpoint_controlnet_path
+        checkpoint_controlnet_path and os.path.exists(latent_disparity_decoder_path)
     ):
         # Load base pipeline from original model (jingheya/lotus-depth-g-v2-1-disparity)
         base_model_path = "jingheya/lotus-depth-g-v2-1-disparity"
@@ -221,6 +224,14 @@ def main():
         )
         pipeline.controlnet = fine_tuned_controlnet
 
+        # Load disparity decoder
+        logging.info(f"Loading disparity decoder from {latent_disparity_decoder_path}")
+        latent_disparity_decoder = LatentDisparityDecoder.from_pretrained(
+            latent_disparity_decoder_path,
+            torch_dtype=dtype,
+        )
+        pipeline.latent_disparity_decoder = latent_disparity_decoder
+
         logging.info(
             f"Successfully loaded fine-tuned models from {args.pretrained_model_name_or_path}"
         )
@@ -238,6 +249,11 @@ def main():
             logging.info("Initializing ControlNet weights from unet")
             pipeline.controlnet = ControlNetModel.from_unet(
                 pipeline.unet, conditioning_channels=4
+            )
+        if pipeline.latent_disparity_decoder is None:
+            logging.info("Initializing disparity decoder weights randomly")
+            pipeline.latent_disparity_decoder = LatentDisparityDecoder(
+                latent_channels=4, out_channels=1
             )
         logging.info(
             f"Successfully loading pipeline from {args.pretrained_model_name_or_path}."
@@ -272,17 +288,22 @@ def main():
                         disparity2depth((data["disparity_maps", 0][0] + 1) / 2)
                     ),
                     save_path=os.path.join(output_dir, f"{frame_idx:04d}_depth_gt.png"),
-                    vmax=50,
+                    vmax=200,
                 )
                 concat_and_visualize_6_depths(
                     set_inf_to_max(
-                        disparity2depth((data["box_disparity_maps", 0][0] + 1) / 2)
+                        disparity2depth((data["latent_box_disparity_maps", 0][0] + 1) / 2)
                     ),
                     save_path=os.path.join(
                         output_dir, f"{frame_idx:04d}_depth_cond.png"
                     ),
-                    vmax=50,
+                    vmax=200,
                 )
+                current_features = pipeline.vae.encode(
+                    data[("pixel_values", 0)].squeeze().to(dtype)
+                ).latent_dist.sample()
+                current_features *= pipeline.vae.config.scaling_factor
+                current_features = current_features.float()
                 if torch.backends.mps.is_available():
                     autocast_ctx = nullcontext()
                 else:
@@ -290,43 +311,64 @@ def main():
                 with autocast_ctx:
                     if args.multi_step:
                         preds = pipeline(
-                            disparity_cond=data["box_disparity_maps", 0][0],
-                            rgb_cond=data["pixel_values", 0][0],
+                            disparity_cond=data["latent_box_disparity_maps", 0][0],
+                            rgb_cond=current_features,
                             prompt=[
                                 "" for _ in range(data["pixel_values", 0].shape[1])
                             ],
                             num_inference_steps=args.num_inference_steps,
                             generator=generator,
-                            output_type="np",
+                            output_type="latent",
                         ).images
                     else:
                         preds = pipeline(
-                            disparity_cond=data["box_disparity_maps", 0][0],
-                            rgb_cond=data["pixel_values", 0][0],
+                            disparity_cond=data["latent_box_disparity_maps", 0][0],
+                            rgb_cond=current_features,
                             prompt=[
                                 "" for _ in range(data["pixel_values", 0].shape[1])
                             ],
                             num_inference_steps=1,
                             generator=generator,
-                            output_type="np",
+                            output_type="latent",
                             timesteps=[args.timestep],
                         ).images
-                rgb_out, disparity_out = np.split(preds, 2, axis=0)  # [6, H, W, 3]
-                disparity_out = disparity_out.mean(axis=-1)  # [6, H, W]
-                concat_and_visualize_6_depths(
-                    set_inf_to_max(disparity2depth(disparity_out)),
-                    save_path=os.path.join(
-                        output_dir, f"{frame_idx:04d}_depth_out.png"
-                    ),
-                    vmax=50,
-                )
-                rgb_out = rgb_out.transpose(0, 3, 1, 2)  # [6, H, W, 3] -> [6, 3, H, W]
+                rgb_latents = preds[: len(preds) // 2]  # [B, 4, H//8, W//8]
+                disparity_latents = preds[len(preds) // 2 :]  # [B, 4, H//8, W//8]
+                rgb_latents = rgb_latents.to(dtype) 
+                rgb_out = pipeline.vae.decode(
+                    rgb_latents / pipeline.vae.config.scaling_factor,
+                    return_dict=False,
+                    generator=generator,
+                )[0]
+                rgb_out = (rgb_out / 2 + 0.5).clamp(0, 1)  # Normalize to [0, 1]
                 concat_6_views(
                     rgb_out,
                 ).save(os.path.join(output_dir, f"{frame_idx:04d}_rgb_out.png"))
-                rgb_out = (
-                    data[("pixel_values", 0)].squeeze() + 1
-                ) / 2  # Use original pixel values for rendering
+
+                disparity_out = pipeline.vae.decode(
+                    disparity_latents / pipeline.vae.config.scaling_factor,
+                    return_dict=False,
+                    generator=generator,
+                )[0]
+                disparity_out = disparity_out.mean(dim=1)
+                disparity_out = (disparity_out / 2 + 0.5).clamp(0, 1)  # Normalize to [0, 1]
+                concat_and_visualize_6_depths(
+                    set_inf_to_max(disparity2depth(disparity_out)),
+                    save_path=os.path.join(output_dir, f"{frame_idx:04d}_depth_out.png"),
+                    vmax=200,
+                )
+                latent_disparity_out = pipeline.decode_latent_disparity(
+                    disparity_latents, pipeline.device
+                )
+                latent_disparity_out = (latent_disparity_out / 2 + 0.5).clamp(
+                    0, 1
+                )  # Normalize to [0, 1]
+                concat_and_visualize_6_depths(
+                    set_inf_to_max(disparity2depth(latent_disparity_out)),
+                    save_path=os.path.join(output_dir, f"{frame_idx:04d}_latent_depth_out.png"),
+                    vmax=200,
+                )
+                rgb_latents = current_features # Use original features for rendering
             elif frame_idx > 6:
                 # Create videos if requested
                 if frame_idx == 7 and args.create_videos:
@@ -337,34 +379,44 @@ def main():
                         create_comparison=args.create_comparison_videos,
                     )
                 continue
-            pixel_values_rendered = render_novel_views_using_point_cloud(
-                current_features=rgb_out,
-                current_depths=set_inf_to_max(disparity2depth(disparity_out)),
-                current_ego_mask=data["ego_masks"].squeeze(),
-                current_intrinsics=data["intrinsics"].squeeze(),
+            novel_features = render_novel_views_using_point_cloud(
+                current_features=rgb_latents.float(),  # Ensure float32 for PyTorch3D compatibility
+                current_depths=set_inf_to_max(disparity2depth(latent_disparity_out.squeeze())),
+                current_ego_mask=data["latent_ego_masks"].squeeze(),
+                current_intrinsics=data["latent_intrinsics"].squeeze(),
                 current_extrinsics=data["extrinsics", 0].squeeze(),
-                novel_intrinsics=data["intrinsics"].squeeze(),
+                novel_intrinsics=data["latent_intrinsics"].squeeze(),
                 novel_extrinsics=data["extrinsics", 1].squeeze(),
+                point_radius=0.05,
+                points_per_pixel=8,
                 current_objs_to_world=data["objs_to_world", 0][0],
                 current_box_sizes=data["box_sizes", 0][0],
                 current_obj_ids=data["obj_ids", 0][0],
                 transforms_cur_to_next=data["transforms", 0, 1][0],
-                expanding_factor=1.0,
-                image_size=(dataset_cfg.height, dataset_cfg.width),
+                expanding_factor=1.5,
+                image_size=(dataset_cfg.height//8, dataset_cfg.width//8),
+                background_color=(0, 0, 0, 0),
                 return_novel_depths=False,
             )["novel_features"]
-
-            pixel_values_rendered = pixel_values_rendered.permute([0,3,1,2])  # [6, H, W, 3] -> [6, 3, H, W]
-            concat_6_views(pixel_values_rendered).save(
+            novel_features = novel_features.permute(
+                [0, 3, 1, 2]
+            )  # [6, H, W, C] -> [6, C, H, W]
+            novel_features = novel_features.to(dtype)
+            novel_images = pipeline.vae.decode(
+                novel_features / pipeline.vae.config.scaling_factor,
+                return_dict=False,
+                generator=generator,
+            )[0]
+            concat_6_views(((novel_images + 1) / 2).clamp(0, 1)).save(
                 os.path.join(output_dir, f"{frame_idx+1:04d}_rgb_cond.png")
             )
 
             concat_and_visualize_6_depths(
                 set_inf_to_max(
-                    disparity2depth((data["box_disparity_maps", 1][0] + 1) / 2)
+                    disparity2depth((data["latent_box_disparity_maps", 1][0] + 1) / 2)
                 ),
                 save_path=os.path.join(output_dir, f"{frame_idx+1:04d}_depth_cond.png"),
-                vmax=50,
+                vmax=200,
             )
             if torch.backends.mps.is_available():
                 autocast_ctx = nullcontext()
@@ -375,37 +427,59 @@ def main():
                 if args.multi_step:
                     # Multi-step inference with proper denoising steps
                     preds = pipeline(
-                        disparity_cond=data["box_disparity_maps", 1][0],
-                        rgb_cond=pixel_values_rendered * 2 - 1,
+                        disparity_cond=data["latent_box_disparity_maps", 1][0],
+                        rgb_cond=novel_features.float(),
                         prompt=["" for _ in range(data["pixel_values", 1].shape[1])],
                         num_inference_steps=args.num_inference_steps,
                         generator=generator,
-                        output_type="np",
+                        output_type="latent",
                     ).images
                 else:
                     # Single-step inference
                     preds = pipeline(
-                        disparity_cond=data["box_disparity_maps", 1][0],
-                        rgb_cond=pixel_values_rendered * 2 - 1,
+                        disparity_cond=data["latent_box_disparity_maps", 1][0],
+                        rgb_cond=novel_features.float(),
                         prompt=["" for _ in range(data["pixel_values", 1].shape[1])],
                         num_inference_steps=1,
                         generator=generator,
-                        output_type="np",
+                        output_type="latent",
                         timesteps=[args.timestep],
                     ).images
+ 
+                rgb_latents = preds[: len(preds) // 2]  # [B, 4, H//8, W//8]
+                disparity_latents = preds[len(preds) // 2 :]  # [B, 4, H//8, W//8]
+                rgb_out = pipeline.vae.decode(
+                    rgb_latents / pipeline.vae.config.scaling_factor,
+                    return_dict=False,
+                    generator=generator,
+                )[0]
+                rgb_out = (rgb_out / 2 + 0.5).clamp(0, 1)  # Normalize to [0, 1]
+                concat_6_views(
+                    rgb_out,
+                ).save(os.path.join(output_dir, f"{frame_idx+1:04d}_rgb_out.png"))
 
-                rgb_out, disparity_out = np.split(
-                    preds, 2, axis=0
-                )  # [6, H, W, 3] #TODO inverse
-                disparity_out = disparity_out.mean(axis=-1)  # [B, H, W]
-                rgb_out = rgb_out.transpose(0, 3, 1, 2)  # [B, 3, H, W]
-
+                disparity_out = pipeline.vae.decode(
+                    disparity_latents / pipeline.vae.config.scaling_factor,
+                    return_dict=False,
+                    generator=generator,
+                )[0]
+                disparity_out = disparity_out.mean(dim=1)
+                disparity_out = (disparity_out / 2 + 0.5).clamp(0, 1)  # Normalize to [0, 1]
                 concat_and_visualize_6_depths(
                     set_inf_to_max(disparity2depth(disparity_out)),
-                    save_path=os.path.join(
-                        output_dir, f"{frame_idx+1:04d}_depth_out.png"
-                    ),
-                    vmax=50,
+                    save_path=os.path.join(output_dir, f"{frame_idx+1:04d}_depth_out.png"),
+                    vmax=200,
+                )
+                latent_disparity_out = pipeline.decode_latent_disparity(
+                    disparity_latents, pipeline.device
+                )
+                latent_disparity_out = (latent_disparity_out / 2 + 0.5).clamp(
+                    0, 1
+                )  # Normalize to [0, 1]
+                concat_and_visualize_6_depths(
+                    set_inf_to_max(disparity2depth(latent_disparity_out)),
+                    save_path=os.path.join(output_dir, f"{frame_idx+1:04d}_latent_depth_out.png"),
+                    vmax=200,
                 )
                 disparity_gt = (data["disparity_maps", 1][0].cpu().numpy() + 1) / 2
                 concat_and_visualize_6_depths(
@@ -413,14 +487,11 @@ def main():
                     save_path=os.path.join(
                         output_dir, f"{frame_idx+1:04d}_depth_gt.png"
                     ),
-                    vmax=50,
+                    vmax=200,
                 )
                 concat_6_views(
                     (data["pixel_values", 1][0] + 1) / 2,  # Normalize to [0, 1]
                 ).save(os.path.join(output_dir, f"{frame_idx+1:04d}_rgb_gt.png"))
-                concat_6_views(
-                    rgb_out,
-                ).save(os.path.join(output_dir, f"{frame_idx+1:04d}_rgb_out.png"))
             torch.cuda.empty_cache()
     print('==> Inference is done. \n==> Results saved to:', args.output_dir)
 

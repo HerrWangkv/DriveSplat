@@ -116,11 +116,11 @@ class LatentDisparityDecoder(ModelMixin, ConfigMixin):
     _supports_gradient_checkpointing = False
 
     @register_to_config
-    def __init__(self, in_channels=1, latent_channels=4, hidden_channels=64):
+    def __init__(self, latent_channels=4, out_channels=1, hidden_channels=64):
         super(LatentDisparityDecoder, self).__init__()
 
         self.latent_channels = latent_channels
-        self.in_channels = in_channels
+        self.out_channels = out_channels
 
         # Decoder network only
         self.decoder = nn.Sequential(
@@ -148,7 +148,7 @@ class LatentDisparityDecoder(ModelMixin, ConfigMixin):
                 hidden_channels // 4, hidden_channels // 4, kernel_size=3, padding=1
             ),
             nn.ReLU(inplace=True),
-            nn.Conv2d(hidden_channels // 4, in_channels, kernel_size=3, padding=1),
+            nn.Conv2d(hidden_channels // 4, out_channels, kernel_size=3, padding=1),
         )
 
         # Initialize weights
@@ -156,7 +156,7 @@ class LatentDisparityDecoder(ModelMixin, ConfigMixin):
 
         # Initialize SSIM loss for reconstruction quality
         self.ssim_loss = SSIM(
-            data_range=2.0, size_average=True, channel=in_channels
+            data_range=2.0, size_average=True, channel=out_channels
         )  # data_range=2 for [-1,1] range
 
     def _init_weights(self):
@@ -234,10 +234,16 @@ class LatentDisparityDecoder(ModelMixin, ConfigMixin):
 
         return loss
 
-    def to(self, device):
-        """Override to method to ensure proper device handling."""
-        super().to(device)
-        self.ssim_loss = self.ssim_loss.to(device)
+    def to(self, device, dtype=None):
+        """
+        Override to method to ensure proper device and dtype handling.
+        """
+        if dtype is None:
+            super().to(device)
+            self.ssim_loss = self.ssim_loss.to(device)
+        else:
+            super().to(device, dtype)
+            self.ssim_loss = self.ssim_loss.to(device, dtype)
         return self
 
 
@@ -292,8 +298,7 @@ class DirectDiffusionControlNetPipeline(
         "feature_extractor",
         "image_encoder",
         "controlnet",
-        "disparity_encoder",
-        "disparity_decoder",
+        "latent_disparity_decoder",
     ]
     _exclude_from_cpu_offload = ["safety_checker"]
     _callback_tensor_inputs = ["latents", "prompt_embeds", "negative_prompt_embeds"]

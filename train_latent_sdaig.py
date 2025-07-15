@@ -677,7 +677,7 @@ def main():
     else:
         logger.info("Initializing new latent disparity decoder weights")
         latent_disparity_decoder = LatentDisparityDecoder(
-            in_channels=1, latent_channels=4
+            latent_channels=4, out_channels=1
         )
 
     # Freeze vae and text_encoder and set unet, controlnet, and latent_disparity_decoder to trainable
