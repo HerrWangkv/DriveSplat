@@ -132,6 +132,72 @@ def parse_args():
 
     return args
 
+
+def load_generation_pipeline(args, dtype, processing_res, device):
+    logging.info(
+        f"Loading pretrained pipeline from {args.pretrained_model_name_or_path}"
+    )
+    pipeline = SDaIGControlNetPipeline.from_pretrained(
+        args.pretrained_model_name_or_path,
+        torch_dtype=dtype,
+    )
+
+    if pipeline.controlnet is None:
+        logging.info("Initializing ControlNet weights from unet")
+        pipeline.controlnet = ControlNetModel.from_unet(
+            pipeline.unet, conditioning_channels=4
+        )
+    if pipeline.latent_disparity_decoder is None:
+        logging.info("Initializing disparity decoder weights randomly")
+        pipeline.latent_disparity_decoder = LatentDisparityDecoder(
+            latent_channels=4, out_channels=1
+        )
+    logging.info(
+        f"Successfully loading pipeline from {args.pretrained_model_name_or_path}."
+    )
+    logging.info(
+        f"processing_res = {processing_res or pipeline.default_processing_resolution}"
+    )
+
+    pipeline = pipeline.to(device)
+    pipeline.set_progress_bar_config(disable=True)
+
+    if args.enable_xformers_memory_efficient_attention:
+        pipeline.enable_xformers_memory_efficient_attention()
+
+    return pipeline
+
+
+def generate_once(args, pipeline, disparity_cond, rgb_cond, generator):
+    if torch.backends.mps.is_available():
+        autocast_ctx = nullcontext()
+    else:
+        autocast_ctx = torch.autocast(pipeline.device.type)
+    with autocast_ctx:
+        if args.multi_step:
+            preds = pipeline(
+                disparity_cond=disparity_cond,
+                rgb_cond=rgb_cond,
+                prompt=["" for _ in range(len(rgb_cond))],
+                num_inference_steps=args.num_inference_steps,
+                generator=generator,
+                output_type="latent",
+            ).images
+        else:
+            preds = pipeline(
+                disparity_cond=disparity_cond,
+                rgb_cond=rgb_cond,
+                prompt=["" for _ in range(len(rgb_cond))],
+                num_inference_steps=1,
+                generator=generator,
+                output_type="latent",
+                timesteps=[args.timestep],
+            ).images
+    rgb_latents = preds[: len(preds) // 2]  # [B, 4, H//8, W//8]
+    disparity_latents = preds[len(preds) // 2 :]  # [B, 4, H//8, W//8]
+    return rgb_latents, disparity_latents
+
+
 def main():
     logging.basicConfig(level=logging.INFO)
     logging.info(f"Run inference...")
@@ -164,15 +230,20 @@ def main():
         logging.warning(
             "Processing at native resolution without resizing output might NOT lead to exactly the same resolution, due to the padding and pooling properties of conv layers."
         )
-    resample_method = args.resample_method
 
-    # -------------------- Device --------------------
+    # device
     if torch.cuda.is_available():
         device = "cuda"
     else:
         device = "cpu"
         logging.warning("CUDA is not available. Running on CPU will be slow.")
     logging.info(f"Device = {device}")
+
+    # seed
+    if args.seed is not None:
+        generator = None
+    else:
+        generator = torch.Generator(device=device).manual_seed(args.seed)
 
     # -------------------- Data --------------------
     dataset_cfg = OmegaConf.load(args.dataset_config)
@@ -186,90 +257,12 @@ def main():
         pin_memory_device=device,
     )
     # -------------------- Model --------------------
-
-    # Check if loading from a checkpoint directory with separate unet/controlnet folders
-    checkpoint_unet_path = os.path.join(args.pretrained_model_name_or_path, "unet")
-    checkpoint_controlnet_path = os.path.join(
-        args.pretrained_model_name_or_path, "controlnet"
+    pipeline = load_generation_pipeline(
+        args,
+        dtype=dtype,
+        processing_res=processing_res,
+        device=device,
     )
-    latent_disparity_decoder_path = os.path.join(
-        args.pretrained_model_name_or_path, "latent_disparity_decoder"
-    )
-
-    if os.path.exists(checkpoint_unet_path) and os.path.exists(
-        checkpoint_controlnet_path and os.path.exists(latent_disparity_decoder_path)
-    ):
-        # Load base pipeline from original model (jingheya/lotus-depth-g-v2-1-disparity)
-        base_model_path = "jingheya/lotus-depth-g-v2-1-disparity"
-        logging.info(f"Loading base pipeline from {base_model_path}")
-        pipeline = SDaIGControlNetPipeline.from_pretrained(
-            base_model_path,
-            torch_dtype=dtype,
-        )
-
-        # Load fine-tuned UNet
-        logging.info(f"Loading fine-tuned UNet from {checkpoint_unet_path}")
-
-        fine_tuned_unet = UNet2DConditionModel.from_pretrained(
-            checkpoint_unet_path,
-            torch_dtype=dtype,
-        )
-        pipeline.unet = fine_tuned_unet
-
-        # Load fine-tuned ControlNet
-        logging.info(f"Loading fine-tuned ControlNet from {checkpoint_controlnet_path}")
-        fine_tuned_controlnet = ControlNetModel.from_pretrained(
-            checkpoint_controlnet_path,
-            torch_dtype=dtype,
-        )
-        pipeline.controlnet = fine_tuned_controlnet
-
-        # Load disparity decoder
-        logging.info(f"Loading disparity decoder from {latent_disparity_decoder_path}")
-        latent_disparity_decoder = LatentDisparityDecoder.from_pretrained(
-            latent_disparity_decoder_path,
-            torch_dtype=dtype,
-        )
-        pipeline.latent_disparity_decoder = latent_disparity_decoder
-
-        logging.info(
-            f"Successfully loaded fine-tuned models from {args.pretrained_model_name_or_path}"
-        )
-    else:
-        # Loading from pretrained model (original behavior)
-        logging.info(
-            f"Loading pretrained pipeline from {args.pretrained_model_name_or_path}"
-        )
-        pipeline = SDaIGControlNetPipeline.from_pretrained(
-            args.pretrained_model_name_or_path,
-            torch_dtype=dtype,
-        )
-
-        if pipeline.controlnet is None:
-            logging.info("Initializing ControlNet weights from unet")
-            pipeline.controlnet = ControlNetModel.from_unet(
-                pipeline.unet, conditioning_channels=4
-            )
-        if pipeline.latent_disparity_decoder is None:
-            logging.info("Initializing disparity decoder weights randomly")
-            pipeline.latent_disparity_decoder = LatentDisparityDecoder(
-                latent_channels=4, out_channels=1
-            )
-        logging.info(
-            f"Successfully loading pipeline from {args.pretrained_model_name_or_path}."
-        )
-    logging.info(f"processing_res = {processing_res or pipeline.default_processing_resolution}")
-
-    pipeline = pipeline.to(device)
-    pipeline.set_progress_bar_config(disable=True)
-
-    if args.enable_xformers_memory_efficient_attention:
-        pipeline.enable_xformers_memory_efficient_attention()
-
-    if args.seed is None:
-        generator = None
-    else:
-        generator = torch.Generator(device=device).manual_seed(args.seed)
 
     # -------------------- Inference and saving --------------------
     with torch.no_grad():
@@ -304,37 +297,13 @@ def main():
                 ).latent_dist.sample()
                 current_features *= pipeline.vae.config.scaling_factor
                 current_features = current_features.float()
-                if torch.backends.mps.is_available():
-                    autocast_ctx = nullcontext()
-                else:
-                    autocast_ctx = torch.autocast(pipeline.device.type)
-                with autocast_ctx:
-                    if args.multi_step:
-                        preds = pipeline(
-                            disparity_cond=data["latent_box_disparity_maps", 0][0],
-                            rgb_cond=current_features,
-                            prompt=[
-                                "" for _ in range(data["pixel_values", 0].shape[1])
-                            ],
-                            num_inference_steps=args.num_inference_steps,
-                            generator=generator,
-                            output_type="latent",
-                        ).images
-                    else:
-                        preds = pipeline(
-                            disparity_cond=data["latent_box_disparity_maps", 0][0],
-                            rgb_cond=current_features,
-                            prompt=[
-                                "" for _ in range(data["pixel_values", 0].shape[1])
-                            ],
-                            num_inference_steps=1,
-                            generator=generator,
-                            output_type="latent",
-                            timesteps=[args.timestep],
-                        ).images
-                rgb_latents = preds[: len(preds) // 2]  # [B, 4, H//8, W//8]
-                disparity_latents = preds[len(preds) // 2 :]  # [B, 4, H//8, W//8]
-                rgb_latents = rgb_latents.to(dtype) 
+                rgb_latents, disparity_latents = generate_once(
+                    args,
+                    pipeline,
+                    disparity_cond=data["latent_box_disparity_maps", 0][0],
+                    rgb_cond=current_features,
+                    generator=generator,
+                )
                 rgb_out = pipeline.vae.decode(
                     rgb_latents / pipeline.vae.config.scaling_factor,
                     return_dict=False,
@@ -418,80 +387,57 @@ def main():
                 save_path=os.path.join(output_dir, f"{frame_idx+1:04d}_depth_cond.png"),
                 vmax=200,
             )
-            if torch.backends.mps.is_available():
-                autocast_ctx = nullcontext()
-            else:
-                autocast_ctx = torch.autocast(pipeline.device.type)
-            with autocast_ctx:
-                # Run inference with appropriate parameters based on training mode
-                if args.multi_step:
-                    # Multi-step inference with proper denoising steps
-                    preds = pipeline(
-                        disparity_cond=data["latent_box_disparity_maps", 1][0],
-                        rgb_cond=novel_features.float(),
-                        prompt=["" for _ in range(data["pixel_values", 1].shape[1])],
-                        num_inference_steps=args.num_inference_steps,
-                        generator=generator,
-                        output_type="latent",
-                    ).images
-                else:
-                    # Single-step inference
-                    preds = pipeline(
-                        disparity_cond=data["latent_box_disparity_maps", 1][0],
-                        rgb_cond=novel_features.float(),
-                        prompt=["" for _ in range(data["pixel_values", 1].shape[1])],
-                        num_inference_steps=1,
-                        generator=generator,
-                        output_type="latent",
-                        timesteps=[args.timestep],
-                    ).images
- 
-                rgb_latents = preds[: len(preds) // 2]  # [B, 4, H//8, W//8]
-                disparity_latents = preds[len(preds) // 2 :]  # [B, 4, H//8, W//8]
-                rgb_out = pipeline.vae.decode(
-                    rgb_latents / pipeline.vae.config.scaling_factor,
-                    return_dict=False,
-                    generator=generator,
-                )[0]
-                rgb_out = (rgb_out / 2 + 0.5).clamp(0, 1)  # Normalize to [0, 1]
-                concat_6_views(
-                    rgb_out,
-                ).save(os.path.join(output_dir, f"{frame_idx+1:04d}_rgb_out.png"))
+            rgb_latents, disparity_latents = generate_once(
+                args,
+                pipeline,
+                disparity_cond=data["latent_box_disparity_maps", 1][0],
+                rgb_cond=novel_features,
+                generator=generator,
+            )
+            rgb_out = pipeline.vae.decode(
+                rgb_latents / pipeline.vae.config.scaling_factor,
+                return_dict=False,
+                generator=generator,
+            )[0]
+            rgb_out = (rgb_out / 2 + 0.5).clamp(0, 1)  # Normalize to [0, 1]
+            concat_6_views(
+                rgb_out,
+            ).save(os.path.join(output_dir, f"{frame_idx+1:04d}_rgb_out.png"))
 
-                disparity_out = pipeline.vae.decode(
-                    disparity_latents / pipeline.vae.config.scaling_factor,
-                    return_dict=False,
-                    generator=generator,
-                )[0]
-                disparity_out = disparity_out.mean(dim=1)
-                disparity_out = (disparity_out / 2 + 0.5).clamp(0, 1)  # Normalize to [0, 1]
-                concat_and_visualize_6_depths(
-                    set_inf_to_max(disparity2depth(disparity_out)),
-                    save_path=os.path.join(output_dir, f"{frame_idx+1:04d}_depth_out.png"),
-                    vmax=200,
-                )
-                latent_disparity_out = pipeline.decode_latent_disparity(
-                    disparity_latents, pipeline.device
-                )
-                latent_disparity_out = (latent_disparity_out / 2 + 0.5).clamp(
-                    0, 1
-                )  # Normalize to [0, 1]
-                concat_and_visualize_6_depths(
-                    set_inf_to_max(disparity2depth(latent_disparity_out)),
-                    save_path=os.path.join(output_dir, f"{frame_idx+1:04d}_latent_depth_out.png"),
-                    vmax=200,
-                )
-                disparity_gt = (data["disparity_maps", 1][0].cpu().numpy() + 1) / 2
-                concat_and_visualize_6_depths(
-                    set_inf_to_max(disparity2depth(disparity_gt)),
-                    save_path=os.path.join(
-                        output_dir, f"{frame_idx+1:04d}_depth_gt.png"
-                    ),
-                    vmax=200,
-                )
-                concat_6_views(
-                    (data["pixel_values", 1][0] + 1) / 2,  # Normalize to [0, 1]
-                ).save(os.path.join(output_dir, f"{frame_idx+1:04d}_rgb_gt.png"))
+            disparity_out = pipeline.vae.decode(
+                disparity_latents / pipeline.vae.config.scaling_factor,
+                return_dict=False,
+                generator=generator,
+            )[0]
+            disparity_out = disparity_out.mean(dim=1)
+            disparity_out = (disparity_out / 2 + 0.5).clamp(0, 1)  # Normalize to [0, 1]
+            concat_and_visualize_6_depths(
+                set_inf_to_max(disparity2depth(disparity_out)),
+                save_path=os.path.join(output_dir, f"{frame_idx+1:04d}_depth_out.png"),
+                vmax=200,
+            )
+            latent_disparity_out = pipeline.decode_latent_disparity(
+                disparity_latents, pipeline.device
+            )
+            latent_disparity_out = (latent_disparity_out / 2 + 0.5).clamp(
+                0, 1
+            )  # Normalize to [0, 1]
+            concat_and_visualize_6_depths(
+                set_inf_to_max(disparity2depth(latent_disparity_out)),
+                save_path=os.path.join(
+                    output_dir, f"{frame_idx+1:04d}_latent_depth_out.png"
+                ),
+                vmax=200,
+            )
+            disparity_gt = (data["disparity_maps", 1][0].cpu().numpy() + 1) / 2
+            concat_and_visualize_6_depths(
+                set_inf_to_max(disparity2depth(disparity_gt)),
+                save_path=os.path.join(output_dir, f"{frame_idx+1:04d}_depth_gt.png"),
+                vmax=200,
+            )
+            concat_6_views(
+                (data["pixel_values", 1][0] + 1) / 2,  # Normalize to [0, 1]
+            ).save(os.path.join(output_dir, f"{frame_idx+1:04d}_rgb_gt.png"))
             torch.cuda.empty_cache()
     print('==> Inference is done. \n==> Results saved to:', args.output_dir)
 
